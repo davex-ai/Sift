@@ -1,0 +1,28 @@
+# ── Core scraping ──────────────────────────────────────────────
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.1.0                     # faster BS4 parser
+python-dotenv>=1.0.0
+
+# ── Playwright (optional but recommended for fallback) ─────────
+playwright>=1.43.0
+# After install run: playwright install chromium
+
+# ── Telegram bot ───────────────────────────────────────────────
+python-telegram-bot>=21.0.0
+
+# ── Database ───────────────────────────────────────────────────
+sqlalchemy>=2.0.0
+aiosqlite>=0.20.0              # async SQLite (optional upgrade path)
+
+# ── LLM (HuggingFace) ──────────────────────────────────────────
+# Option A: direct HTTP (already included via requests)
+# Option B: huggingface_hub client (uncomment if preferred)
+# huggingface-hub>=0.23.0
+
+# ── Utilities ──────────────────────────────────────────────────
+python-dateutil>=2.9.0
+
+# ── Dev / testing ──────────────────────────────────────────────
+# pytest>=8.0.0
+# pytest-asyncio>=0.23.0
