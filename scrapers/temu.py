@@ -105,48 +105,74 @@ class TemuScraper(BaseScraper):
         return products
 
     def _extract_from_json(self, html: str, max_results: int) -> list[Product]:
-        """
-        Temu embeds product data in window.__PRELOADED_STATE__ or similar.
-        This is faster and more reliable than CSS parsing.
-        """
-        patterns = [
-            r"window\.__PRELOADED_STATE__\s*=\s*({.*?});\s*</script>",
-            r"window\.__DATA__\s*=\s*({.*?});\s*</script>",
-            r'"goodsList"\s*:\s*(\[.*?\])',
-            r'"searchResult"\s*:\s*({.*?})\s*[,}]',
-        ]
+        import re, json
 
-        for pattern in patterns:
+        # Pattern 1: Next.js standard data island — most reliable
+        m = re.search(
+            r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+            html,
+            re.DOTALL,
+        )
+        if m:
             try:
-                m = re.search(pattern, html, re.DOTALL)
-                if not m:
-                    continue
+                data = json.loads(m.group(1))
+                products = self._parse_goods_json(data, max_results)
+                if products:
+                    logger.info(f"[Temu] Extracted via __NEXT_DATA__")
+                    return products
+            except Exception as e:
+                logger.debug(f"[Temu] __NEXT_DATA__ parse fail: {e}")
+
+        # Pattern 2: window.__NEXT_DATA__ assigned in script tag
+        m = re.search(r'window\.__NEXT_DATA__\s*=\s*({.*?})\s*;?\s*</script>', html, re.DOTALL)
+        if m:
+            try:
                 data = json.loads(m.group(1))
                 products = self._parse_goods_json(data, max_results)
                 if products:
                     return products
-            except (json.JSONDecodeError, KeyError, TypeError):
-                continue
+            except Exception:
+                pass
+
+        # Pattern 3: Inline JSON blobs containing goodsList
+        for pattern in [
+            r'"goodsList"\s*:\s*(\[.*?\])\s*[,}]',
+            r'"goods_list"\s*:\s*(\[.*?\])\s*[,}]',
+            r'"searchGoodsList"\s*:\s*(\[.*?\])\s*[,}]',
+            r'"result"\s*:\s*\{[^}]*"goods"\s*:\s*(\[.*?\])',
+        ]:
+            m = re.search(pattern, html, re.DOTALL)
+            if m:
+                try:
+                    items = json.loads(m.group(1))
+                    products = self._parse_goods_json(items, max_results)
+                    if products:
+                        return products
+                except Exception:
+                    continue
 
         return []
 
     def _parse_goods_json(self, data: dict | list, max_results: int) -> list[Product]:
-        """Walk JSON and extract product entries."""
         goods_list = []
 
-        def walk(obj):
+        def walk(obj, depth=0):
+            if depth > 12:  # don't recurse forever
+                return
             if isinstance(obj, list):
                 for item in obj:
-                    walk(item)
+                    walk(item, depth + 1)
             elif isinstance(obj, dict):
-                # Heuristic: looks like a product if it has title/price/goods_id
-                if all(k in obj for k in ("goods_name", "price")):
-                    goods_list.append(obj)
-                elif all(k in obj for k in ("title", "salePrice")):
+                # Broader match — any dict with a name-like and price-like field
+                has_name = any(k in obj for k in ("goods_name", "title", "name", "product_name", "display_name"))
+                has_price = any(k in obj for k in ("price", "salePrice", "sale_price", "original_price", "goods_price"))
+                has_id = any(k in obj for k in ("goods_id", "id", "product_id", "item_id"))
+                if has_name and (has_price or has_id):
                     goods_list.append(obj)
                 else:
                     for v in obj.values():
-                        walk(v)
+                        if isinstance(v, (dict, list)):
+                            walk(v, depth + 1)
 
         walk(data)
 
@@ -158,7 +184,6 @@ class TemuScraper(BaseScraper):
                     products.append(p)
             except Exception:
                 continue
-
         return products
 
     def _product_from_json(self, item: dict) -> Optional[Product]:

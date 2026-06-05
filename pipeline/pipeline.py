@@ -19,7 +19,7 @@ then synthesize a single coherent answer.
 import logging
 import asyncio
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from scrapers import build_scrapers
@@ -137,51 +137,36 @@ class ShoppingPipeline:
 
     # ── Parallel scraping ─────────────────────────────────────
 
-    def _scrape_parallel(
-        self,
-        query: str,
-        scrapers: dict,
-    ) -> list[Product]:
-        """
-        Run all scrapers concurrently in a thread pool.
-        Max total threads = config.MAX_CONCURRENT_TOTAL.
-        """
+    def _scrape_parallel(self, query: str, scrapers: dict) -> list[Product]:
         all_products: list[Product] = []
         max_workers = min(len(scrapers), config.MAX_CONCURRENT_TOTAL)
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {
-                pool.submit(
-                    self._scrape_one, name, scraper, query
-                ): name
+                pool.submit(self._scrape_one, name, scraper, query): name
                 for name, scraper in scrapers.items()
             }
-            done, not_done = wait(
-                futures,
-                timeout=60
-            )
+            try:
+                # as_completed processes each result the moment it arrives
+                # timeout=150 gives ScraperAPI(55s) + Playwright(60s) room to breathe
+                for future in as_completed(futures, timeout=150):
+                    store = futures[future]
+                    try:
+                        products = future.result()
+                        count = len(products)
+                        logger.info(f"[Pipeline] {store}: {count} results")
+                        if count == 0 and config.ALERT_ON_ZERO_RESULTS:
+                            logger.warning(
+                                f"[Pipeline] ⚠️  {store} returned 0 results — "
+                                "selector may be stale"
+                            )
+                        all_products.extend(products)
+                    except Exception as e:
+                        logger.error(f"[Pipeline] {store} failed: {e}")
 
-            for future in not_done:
-                logger.warning("Scraper timed out")
-
-            for future in done:
-                store = futures[future]
-                try:
-                    products = future.result()
-                    count = len(products)
-                    logger.info(f"[Pipeline] {store}: {count} results")
-
-                    # Health check
-                    if count == 0 and config.ALERT_ON_ZERO_RESULTS:
-                        logger.warning(
-                            f"[Pipeline] ⚠️  {store} returned 0 results — "
-                            "selector may be stale"
-                        )
-
-                    all_products.extend(products)
-
-                except Exception as e:
-                    logger.error(f"[Pipeline] {store} failed: {e}")
+            except TimeoutError:
+                remaining = [futures[f] for f in futures if not f.done()]
+                logger.warning(f"[Pipeline] Timed out waiting for: {remaining}")
 
         return all_products
 

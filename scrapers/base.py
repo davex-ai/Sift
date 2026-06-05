@@ -188,7 +188,7 @@ class BaseScraper(ABC):
             resp = requests.get(
                 api_url,
                 headers=session_headers(self.SOURCE_NAME),
-                timeout=35,
+                timeout=55,
             )
             resp.raise_for_status()
             if len(resp.text) < 500:

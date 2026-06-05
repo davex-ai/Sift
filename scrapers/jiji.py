@@ -82,6 +82,22 @@ class JijiScraper(BaseScraper):
         logger.info(f"[Jiji] Found {len(products)} products")
         return products
 
+    # In jiji.py — add this method to override base class behavior
+
+    def search(self, query: str, max_results: int = 10) -> list[Product]:
+        from urllib.parse import quote_plus
+        # Jiji search URL — note it's /q not /search
+        url = f"{JIJI_BASE}/q?query={quote_plus(query)}"
+        logger.info(f"[Jiji] Searching: {query}")
+        html = self._fetch_with_retry(url)
+        if not html:
+            return []
+        # If we got very little HTML, it's the shell — skip
+        if len(html) < 20_000:
+            logger.warning(f"[Jiji] Got {len(html)} bytes — page may not have rendered. Try ScraperAPI.")
+            return []
+        return self._parse_html(html, max_results)
+
     def _parse_html(self, html: str, max_results: int) -> list[Product]:
         soup = BeautifulSoup(html, "html.parser")
 
