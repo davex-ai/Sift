@@ -24,6 +24,8 @@ class JumiaScraper(BaseScraper):
 
     SOURCE_NAME = "jumia"
     PROFILE = "jumia"
+    BLOCK_IMAGES = False
+    PLAYWRIGHT_WAIT_UNTIL = "networkidle"
 
     SELECTORS = {
         # Primary selectors
@@ -123,7 +125,7 @@ class JumiaScraper(BaseScraper):
             review_count=review_count,
             image_url=image_url,
             availability="in_stock" if price_ngn else "unknown",
-            fetched_via="scraperapi",
+            fetched_via=getattr(self, "SOURCE_NAME", "jumia"),
             extra={"old_price": old_price_raw},
         )
 

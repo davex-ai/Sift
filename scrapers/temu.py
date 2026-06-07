@@ -66,6 +66,136 @@ class TemuScraper(BaseScraper):
             "[class*='rating']",
         ],
     }
+    # self._load_temu_cookies(context)
+
+    def _load_temu_cookies(self, context) -> bool:
+        """
+        Load saved Temu cookies from temu_cookies.json.
+        Export from Chrome: EditThisCookie extension → Export.
+        """
+        import json
+        from pathlib import Path
+
+        cookie_file = Path("temu_cookies.json")
+        if not cookie_file.exists():
+            logger.debug("[Temu] No cookie file found — skipping cookie injection")
+            return False
+
+        try:
+            raw = json.loads(cookie_file.read_text())
+
+            # Chrome exports in slightly different format than Playwright expects
+            cookies = []
+            for c in raw:
+                cookie = {
+                    "name": c["name"],
+                    "value": c["value"],
+                    "domain": c.get("domain", ".temu.com"),
+                    "path": c.get("path", "/"),
+                }
+                # Optional fields — only add if present and valid
+                if c.get("expirationDate"):
+                    cookie["expires"] = int(c["expirationDate"])
+                if "httpOnly" in c:
+                    cookie["httpOnly"] = c["httpOnly"]
+                if "secure" in c:
+                    cookie["secure"] = c["secure"]
+                if "sameSite" in c:
+                    same = c["sameSite"]
+                    if same in ("Strict", "Lax", "None"):
+                        cookie["sameSite"] = same
+                cookies.append(cookie)
+
+            context.add_cookies(cookies)
+            logger.info(f"[Temu] Injected {len(cookies)} cookies")
+            return True
+
+        except Exception as e:
+            logger.warning(f"[Temu] Cookie load failed: {e}")
+            return False
+
+    # In TemuScraper only — NOT in BaseScraper
+
+    def _fetch_playwright(self, url: str) -> Optional[str]:
+        """Temu override: inject cookies before navigation."""
+        try:
+            from playwright.sync_api import sync_playwright
+            import time, random
+
+            fp = self._fingerprint()
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                        "--window-size=1366,768",
+                        "--disable-gpu",
+                        "--lang=en-NG",
+                    ],
+                )
+                context = browser.new_context(
+                    user_agent=fp["user_agent"],
+                    viewport={"width": 1366, "height": 768},
+                    locale="en-NG",
+                    timezone_id="Africa/Lagos",
+                )
+                context.add_init_script(self._stealth_js(fp))
+
+                # Inject cookies BEFORE any navigation
+                cookie_loaded = self._load_temu_cookies(context)
+                if cookie_loaded:
+                    logger.info("[Temu] Cookies injected — attempting direct search")
+
+                page = context.new_page()
+                page.route(
+                    "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,eot}",
+                    lambda r: r.abort(),
+                )
+
+                page.goto(url, wait_until="domcontentloaded", timeout=40_000)
+                time.sleep(3.0)
+                html_lower = page.content().lower()
+
+
+                if any(term in html_lower for term in ["challenge", "robot", "verify", "unusual traffic"]):
+                    logger.error("[Temu] Playwright hit a hard Captcha/Security wall. Aborting.")
+                    browser.close()
+                    return None
+
+                # If still on login page, try clicking Continue
+                if "login" in page.url.lower():
+                    logger.info("[Temu] Still on login page — trying Continue button")
+                    for sel in ["button:has-text('Continue')", "[class*='continue']", "button[type='submit']"]:
+                        try:
+                            page.click(sel, timeout=2000)
+                            time.sleep(2.0)
+                            break
+                        except Exception:
+                            continue
+                    # If click helped, navigate to search
+                    if "login" not in page.url.lower():
+                        page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+                        time.sleep(2.0)
+
+                try:
+                    page.wait_for_selector("a[href*='/goods'], [data-goods-id]", timeout=8_000)
+                except Exception:
+                    pass
+
+                self._human_scroll(page)
+                html = page.content()
+                browser.close()
+
+                has_products = "goods_id" in html.lower()
+                logger.info(
+                    f"[Temu] Playwright done. URL: {page.url[:80]}. Has goods_id: {has_products}. Size: {len(html)}")
+                return html
+
+        except Exception as e:
+            logger.error(f"[Temu][Playwright] {e}")
+            return None
 
     def search(self, query: str, max_results: int = 10) -> list[Product]:
         if not config.SCRAPERAPI_KEY:
@@ -79,6 +209,7 @@ class TemuScraper(BaseScraper):
             f"?search_key={quote_plus(query)}"
             f"&search_method=user"
         )
+
         logger.info(f"[Temu] Searching: {query}")
 
         # Temu: try ScraperAPI with JS render first, then Playwright
@@ -92,6 +223,25 @@ class TemuScraper(BaseScraper):
         if not html:
             logger.error("[Temu] All fetch strategies failed")
             return []
+
+        checks = [
+            "login",
+            "sign in",
+            "verify",
+            "human",
+            "robot",
+            "challenge",
+            "security",
+            "unusual traffic"
+        ]
+
+        for c in checks:
+            print(c, c in html.lower())
+
+        with open("temu_debug.html", "w", encoding="utf8") as f:
+            f.write(html)
+        print(repr(html[:200]))
+        print(type(html))
 
         # Try JSON embedded state first (faster than CSS parsing)
         products = self._extract_from_json(html, max_results)
@@ -107,39 +257,70 @@ class TemuScraper(BaseScraper):
     def _extract_from_json(self, html: str, max_results: int) -> list[Product]:
         import re, json
 
-        # Pattern 1: Next.js standard data island — most reliable
-        m = re.search(
-            r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-            html,
-            re.DOTALL,
-        )
+        # ── Pattern 1: Standard __NEXT_DATA__ ─────────────────────
+        m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
         if m:
             try:
                 data = json.loads(m.group(1))
                 products = self._parse_goods_json(data, max_results)
                 if products:
-                    logger.info(f"[Temu] Extracted via __NEXT_DATA__")
+                    logger.info("[Temu] Extracted via __NEXT_DATA__")
                     return products
             except Exception as e:
                 logger.debug(f"[Temu] __NEXT_DATA__ parse fail: {e}")
 
-        # Pattern 2: window.__NEXT_DATA__ assigned in script tag
+        # ── Pattern 2: window.__NEXT_DATA__ ───────────────────────
         m = re.search(r'window\.__NEXT_DATA__\s*=\s*({.*?})\s*;?\s*</script>', html, re.DOTALL)
         if m:
             try:
-                data = json.loads(m.group(1))
-                products = self._parse_goods_json(data, max_results)
+                products = self._parse_goods_json(json.loads(m.group(1)), max_results)
                 if products:
                     return products
             except Exception:
                 pass
 
-        # Pattern 3: Inline JSON blobs containing goodsList
+        # ── Pattern 3: Temu inline script blobs (works on login redirect page) ──
+        # Temu embeds search result state in multiple inline <script> blocks
+        script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
+        for block in script_blocks:
+            # Skip tiny blocks
+            if len(block) < 100:
+                continue
+            # Look for JSON objects containing goods_id
+            json_candidates = re.findall(r'\{[^{}]*"goods_id"[^{}]*\}', block)
+            for candidate in json_candidates[:50]:
+                try:
+                    item = json.loads(candidate)
+                    p = self._product_from_json(item)
+                    if p:
+                        # Found at least one — now get all from this block
+                        all_in_block = re.findall(
+                            r'\{(?:[^{}]|\{[^{}]*\})*"goods_id"(?:[^{}]|\{[^{}]*\})*\}',
+                            block
+                        )
+                        products = []
+                        for raw in all_in_block[:max_results]:
+                            try:
+                                obj = json.loads(raw)
+                                prod = self._product_from_json(obj)
+                                if prod:
+                                    products.append(prod)
+                            except Exception:
+                                continue
+                        if products:
+                            logger.info(f"[Temu] Extracted {len(products)} via inline script block")
+                            return products
+                except Exception:
+                    continue
+
+        # ── Pattern 4: goodsList / goods_list arrays ───────────────
         for pattern in [
             r'"goodsList"\s*:\s*(\[.*?\])\s*[,}]',
             r'"goods_list"\s*:\s*(\[.*?\])\s*[,}]',
             r'"searchGoodsList"\s*:\s*(\[.*?\])\s*[,}]',
             r'"result"\s*:\s*\{[^}]*"goods"\s*:\s*(\[.*?\])',
+            r'"data"\s*:\s*\{"goods"\s*:\s*(\[.*?\])',  # ← Temu login page pattern
+            r'"goods"\s*:\s*(\[[^\[\]]{100,}\])',  # ← any goods array
         ]:
             m = re.search(pattern, html, re.DOTALL)
             if m:
@@ -147,9 +328,34 @@ class TemuScraper(BaseScraper):
                     items = json.loads(m.group(1))
                     products = self._parse_goods_json(items, max_results)
                     if products:
+                        logger.info(f"[Temu] Extracted via pattern: {pattern[:40]}")
                         return products
                 except Exception:
                     continue
+
+        # ── Pattern 5: Extract goods_ids and build URLs (last resort) ──
+        goods_ids = re.findall(r'"goods_id"\s*:\s*"?(\d+)"?', html)
+        goods_ids = list(dict.fromkeys(goods_ids))[:max_results]  # deduplicated
+        if goods_ids:
+            logger.info(f"[Temu] Found {len(goods_ids)} goods_ids — building stub products")
+            products = []
+            # Try to get names paired with IDs
+            for gid in goods_ids:
+                # Look for goods_name near this goods_id
+                pattern = rf'"goods_name"\s*:\s*"([^"]+)"[^{{}}]{{0,500}}"goods_id"\s*:\s*"?{gid}"?'
+                name_m = re.search(pattern, html) or re.search(
+                    rf'"goods_id"\s*:\s*"?{gid}"?[^{{}}]{{0,500}}"goods_name"\s*:\s*"([^"]+)"', html
+                )
+                title = name_m.group(1) if name_m else f"Temu Product {gid}"
+                products.append(Product(
+                    title=title,
+                    source=self.SOURCE_NAME,
+                    url=f"{TEMU_BASE}/goods.html?goods_id={gid}",
+                    availability="in_stock",
+                    fetched_via="goods_id_extraction",
+                ))
+            if products:
+                return products
 
         return []
 

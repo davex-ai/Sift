@@ -1,22 +1,25 @@
 """
 Slot Nigeria scraper.
-URL: https://www.slot.ng/shop?q=<query>
+URL: https://slot.ng/shop?q=<query>
 
-Slot.ng uses WooCommerce. HTML structure is stable and clean.
+Slot.ng uses a modern Next.js + Tailwind layout.
 Specializes in phones, tablets, laptops, accessories.
 """
 
+import time
+import random
 import re
 import logging
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus, urljoin
 from typing import Optional
+from utils.headers import session_headers
 
 from .base import BaseScraper, Product
 from utils.currency import parse_ngn
 
 logger = logging.getLogger(__name__)
-SLOT_BASE = "https://www.slot.ng"
+SLOT_BASE = "https://slot.ng"
 
 
 class SlotScraper(BaseScraper):
@@ -24,60 +27,12 @@ class SlotScraper(BaseScraper):
     SOURCE_NAME = "slot"
     PROFILE = "generic"
 
-    # WooCommerce selectors — very stable
-    SELECTORS = {
-        "product_card": [
-            "li.product",
-            "li[class*='product-type']",
-            "div.product-inner",
-        ],
-        "title": [
-            "h2.woocommerce-loop-product__title",
-            "h2.product-title",
-            "h3.product-title",
-            "[class*='product-title']",
-            "a.product-loop-title",
-        ],
-        "price": [
-            "span.woocommerce-Price-amount.amount",
-            "bdi",
-            "span.price-amount",
-            "[class*='price']:not([class*='old'])",
-        ],
-        "old_price": [
-            "del span.woocommerce-Price-amount",
-            "del bdi",
-            "span.price del",
-        ],
-        "rating": [
-            "div.star-rating",
-            "[class*='star-rating']",
-            "span[class*='rating']",
-        ],
-        "review_count": [
-            "span.count",
-            "span[class*='rating-count']",
-        ],
-        "image": [
-            "img.attachment-woocommerce_thumbnail",
-            "img[class*='product-thumbnail']",
-            "div.thumbnail-wrapper img",
-            "figure img",
-        ],
-        "link": [
-            "a.woocommerce-LoopProduct-link",
-            "a[href*='/product/']",
-            "a.product-loop-title",
-        ],
-        "availability": [
-            "p.stock.in-stock",
-            "p.stock.out-of-stock",
-            "[class*='availability']",
-        ],
-    }
+    # We keep SELECTORS empty/minimal to bypass the legacy architecture matching
+    # and explicitly override the entry methods for modern safety.
+    SELECTORS = {}
 
     def search(self, query: str, max_results: int = 10) -> list[Product]:
-        url = f"{SLOT_BASE}/search/shop?q={quote_plus(query)}&post_type=product"
+        url = f"{SLOT_BASE}/shop?q={quote_plus(query)}"
         logger.info(f"[Slot] Searching: {query}")
 
         html = self._fetch_with_retry(url)
@@ -85,96 +40,116 @@ class SlotScraper(BaseScraper):
             logger.error(f"[Slot] No HTML for query: {query}")
             return []
 
+        with open("slot_debug.html", "w", encoding="utf8") as f:
+            f.write(html)
+
         products = self._parse_html(html, max_results)
         logger.info(f"[Slot] Found {len(products)} products")
         return products
 
     def _parse_html(self, html: str, max_results: int) -> list[Product]:
         soup = BeautifulSoup(html, "html.parser")
-
-        cards = self.try_selectors_all(soup, self.SELECTORS["product_card"])
-        if not cards:
-            logger.warning("[Slot] No product cards — WooCommerce selectors may be stale")
-            return []
-
         products = []
-        for card in cards[:max_results]:
+
+        # Target the explicit shop grid product cards (Scenario B)
+        grid_cards = soup.find_all(
+            "div", class_=lambda c: c and "group" in c and "flex-col" in c
+        )
+
+        for card in grid_cards:
+            if len(products) >= max_results:
+                break
+
             try:
-                p = self._parse_card(card)
+                # Contextually filter to ensure it's a real product card
+                link_tag = card.find("a", href=re.compile(r"^/products?/"))
+                if not link_tag:
+                    continue
+
+                p = self._parse_card_context(card, link_tag)
                 if p:
                     products.append(p)
             except Exception as e:
                 logger.debug(f"[Slot] Card parse error: {e}")
                 continue
 
+        # Fallback: If shop grid is empty (e.g. Next.js payload haven't populated yet),
+        # scrape the search dropdown payload embedded in the DOM layout (Scenario A)
+        if not products:
+            dropdown_container = soup.find(
+                "div", class_=lambda c: c and "absolute" in c and "max-h-95" in c
+            )
+            if dropdown_container:
+                items = dropdown_container.find_all(
+                    "div", class_=lambda c: c and "cursor-pointer" in c
+                )
+                for item in items:
+                    if len(products) >= max_results:
+                        break
+                    try:
+                        p = self._parse_dropdown_item(item)
+                        if p:
+                            products.append(p)
+                    except Exception as e:
+                        logger.debug(f"[Slot] Dropdown item parse error: {e}")
+                        continue
+
         return products
 
-    def _parse_card(self, card) -> Optional[Product]:
-        # Title
-        title_el = self.try_selectors(card, self.SELECTORS["title"])
-        if not title_el:
-            return None
-        title = title_el.get_text(strip=True)
+    def _parse_card_context(self, card, link_tag) -> Optional[Product]:
+        """Parses a product from the main shop grid."""
+        img_tag = link_tag.find("img")
+        title = img_tag.get("alt") if img_tag else None
         if not title:
             return None
 
-        # Link
-        link_el = self.try_selectors(card, self.SELECTORS["link"])
-        url = ""
-        if link_el and link_el.get("href"):
-            url = link_el["href"]
-            if not url.startswith("http"):
-                url = urljoin(SLOT_BASE, url)
-        if not url:
-            return None
+        # Build clean absolute product link
+        url = link_tag.get("href", "")
+        if url and not url.startswith("http"):
+            url = urljoin(SLOT_BASE, url)
 
-        # Price — WooCommerce has nested bdi tag
-        price_el = self.try_selectors(card, self.SELECTORS["price"])
+        # Get structural text-red container for price
+        price_el = card.find("span", class_=lambda c: c and "text-red-600" in c)
         price_raw = price_el.get_text(strip=True) if price_el else ""
         price_ngn = parse_ngn(price_raw)
 
-        # Old price
-        old_el = self.try_selectors(card, self.SELECTORS["old_price"])
-        old_price = old_el.get_text(strip=True) if old_el else ""
+        image_url = img_tag.get("src") if img_tag else None
 
-        # Rating (WooCommerce star ratings)
-        rating_el = self.try_selectors(card, self.SELECTORS["rating"])
-        rating = None
-        if rating_el:
-            # WooCommerce: aria-label="Rated 4.00 out of 5"
-            aria = rating_el.get("aria-label", "")
-            if not aria:
-                aria = rating_el.get_text(strip=True)
-            rating = _parse_rating(aria)
+        return Product(
+            title=title.strip(),
+            source=self.SOURCE_NAME,
+            url=url,
+            price_ngn=price_ngn,
+            price_raw=price_raw,
+            currency="NGN",
+            rating=None,
+            review_count=None,
+            image_url=image_url,
+            availability="in_stock" if price_ngn else "unknown",
+            fetched_via="playwright",
+            extra={},
+        )
 
-        # Review count
-        rev_el = self.try_selectors(card, self.SELECTORS["review_count"])
-        review_count = None
-        if rev_el:
-            m = re.search(r"(\d+)", rev_el.get_text())
-            review_count = int(m.group(1)) if m else None
+    def _parse_dropdown_item(self, item) -> Optional[Product]:
+        """Parses a product fallback from the autocomplete overlay."""
+        title_tag = item.find("div", class_=lambda c: c and "truncate" in c)
+        price_tag = item.find("div", class_=lambda c: c and "text-red-600" in c)
 
-        # Image
-        img_el = self.try_selectors(card, self.SELECTORS["image"])
-        image_url = None
-        if img_el:
-            image_url = (
-                img_el.get("data-src")
-                or img_el.get("data-lazy-src")
-                or img_el.get("src")
-            )
+        if not title_tag or not price_tag:
+            return None
 
-        # Availability
-        avail_el = self.try_selectors(card, self.SELECTORS["availability"])
-        availability = "unknown"
-        if avail_el:
-            text = avail_el.get_text(strip=True).lower()
-            if "in stock" in text or "available" in text:
-                availability = "in_stock"
-            elif "out of stock" in text:
-                availability = "out_of_stock"
-        elif price_ngn:
-            availability = "in_stock"
+        title = title_tag.get_text(strip=True)
+        price_raw = price_tag.get_text(strip=True)
+        price_ngn = parse_ngn(price_raw)
+
+        # Dropdown links usually target the card component or wrapper parent anchor if available
+        link_tag = item.find_parent("a") or item.find("a")
+        url = link_tag.get("href", f"/shop?q={quote_plus(title)}") if link_tag else f"/shop?q={quote_plus(title)}"
+        if url and not url.startswith("http"):
+            url = urljoin(SLOT_BASE, url)
+
+        img_tag = item.find("img")
+        image_url = img_tag.get("src") if img_tag else None
 
         return Product(
             title=title,
@@ -183,18 +158,75 @@ class SlotScraper(BaseScraper):
             price_ngn=price_ngn,
             price_raw=price_raw,
             currency="NGN",
-            rating=rating,
-            review_count=review_count,
+            rating=None,
+            review_count=None,
             image_url=image_url,
-            availability=availability,
-            fetched_via="scraperapi",
-            extra={"old_price": old_price},
+            availability="in_stock",
+            fetched_via="playwright",
+            extra={"context": "search_dropdown"},
         )
 
+    def _fetch_playwright(self, url: str) -> Optional[str]:
+        try:
+            from playwright.sync_api import sync_playwright
 
-# ── Helpers ───────────────────────────────────────────────────
+            fp = self._fingerprint()
 
-def _parse_rating(s: str) -> Optional[float]:
-    m = re.search(r"(\d+\.?\d*)", s)
-    v = float(m.group(1)) if m else None
-    return v if v and v <= 5.0 else None
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-infobars",
+                        "--window-size=1366,768",
+                        "--disable-extensions",
+                        "--disable-gpu",
+                        f"--lang={fp['locale']}",
+                    ],
+                )
+                context = browser.new_context(
+                    user_agent=fp["user_agent"],
+                    viewport={"width": 1366, "height": 768},
+                    locale=fp["locale"],
+                    timezone_id=fp["timezone"],
+                    extra_http_headers=session_headers(self.SOURCE_NAME),
+                )
+                context.add_init_script(self._stealth_js(fp))
+
+                page = context.new_page()
+                if getattr(self, "BLOCK_IMAGES", True):
+                    page.route(
+                        "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,otf,eot}",
+                        lambda r: r.abort(),
+                    )
+
+                # Inside your _fetch_playwright method, locate this block:
+                time.sleep(random.uniform(0.3, 0.8))
+                page.goto(url, wait_until="networkidle", timeout=30_000)
+
+                # 🔴 CHANGE THIS PART:
+                # Force Playwright to wait for either the main shop grid OR the search text state to finish hydrating
+                try:
+                    # Look for a common denominator element that proves Next.js hydration completed
+                    page.wait_for_selector("div[class*='grid']", timeout=15_000)
+                except Exception:
+                    # Fallback to waiting for any element tracking an anchor link to slot products
+                    try:
+                        page.wait_for_selector("a[href*='/product']", timeout=5_000)
+                    except Exception:
+                        logger.warning(f"[{self.SOURCE_NAME}] Playwright wait timed out; parsing partial HTML.")
+
+                self._human_scroll(page)
+                html = page.content()
+                browser.close()
+                logger.info(f"[{self.SOURCE_NAME}] Playwright OK ({len(html)} bytes)")
+                return html
+
+        except ImportError:
+            logger.error("[BaseScraper] Playwright not installed.")
+            return None
+        except Exception as e:
+            logger.error(f"[{self.SOURCE_NAME}][Playwright] {e}")
+            return None

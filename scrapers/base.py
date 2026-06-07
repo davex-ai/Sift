@@ -203,10 +203,6 @@ class BaseScraper(ABC):
     # ── Playwright ─────────────────────────────────────────────
 
     def _fetch_playwright(self, url: str) -> Optional[str]:
-        """
-        Stealth Playwright fetch.
-        Applies all 20 anti-detection patches from stealth profile.
-        """
         try:
             from playwright.sync_api import sync_playwright
 
@@ -233,39 +229,34 @@ class BaseScraper(ABC):
                     timezone_id=fp["timezone"],
                     extra_http_headers=session_headers(self.SOURCE_NAME),
                 )
-
-                # Inject anti-detection JS
                 context.add_init_script(self._stealth_js(fp))
 
                 page = context.new_page()
+                if getattr(self, "BLOCK_IMAGES", True):
+                    page.route(
+                        "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,otf,eot}",
+                        lambda r: r.abort(),
+                    )
 
-                # Block heavy resources
-                page.route(
-                    "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,otf,eot}",
-                    lambda r: r.abort(),
-                )
-
-                # Simulate human arrival
                 time.sleep(random.uniform(0.3, 0.8))
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
-                # Wait for product content (best-effort)
                 wait_sel = self.SELECTORS.get("product_card", "body")
+                if isinstance(wait_sel, list):
+                    wait_sel = wait_sel[0]
                 try:
                     page.wait_for_selector(wait_sel, timeout=10_000)
                 except Exception:
-                    pass  # continue anyway
+                    pass
 
-                # Subtle scroll to trigger lazy images
                 self._human_scroll(page)
-
                 html = page.content()
                 browser.close()
                 logger.info(f"[{self.SOURCE_NAME}] Playwright OK ({len(html)} bytes)")
                 return html
 
         except ImportError:
-            logger.error("[BaseScraper] Playwright not installed. pip install playwright && playwright install chromium")
+            logger.error("[BaseScraper] Playwright not installed.")
             return None
         except Exception as e:
             logger.error(f"[{self.SOURCE_NAME}][Playwright] {e}")

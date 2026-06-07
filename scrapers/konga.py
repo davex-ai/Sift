@@ -1,18 +1,18 @@
 """
 Konga Nigeria scraper.
-URL pattern: https://www.konga.com/search?search=<query>
 
-Konga uses React SSR. The product grid is mostly server-rendered.
-Multiple selector fallbacks are used since class names can change
-between deployments.
+Uses Konga's internal APIs directly — discovered via network capture.
+No Playwright or ScraperAPI needed.
 
-Fallback chain: ScraperAPI → Playwright → plain requests.
+Primary:  POST https://api.konga.com/v1/graphql
+Fallback: POST https://kss.igbimo.com/search
 """
 
 import re
 import logging
-from bs4 import BeautifulSoup
-from urllib.parse import quote_plus, urljoin
+import json
+import requests as req
+from urllib.parse import quote_plus
 from typing import Optional
 
 from .base import BaseScraper, Product
@@ -21,162 +21,230 @@ from utils.currency import parse_ngn
 logger = logging.getLogger(__name__)
 KONGA_BASE = "https://www.konga.com"
 
+# ── Confirmed from network capture ────────────────────────────
+GRAPHQL_URL = "https://api.konga.com/v1/graphql"
+KSS_URL     = "https://kss.igbimo.com/search"
+KSS_API_KEY = "kss_pub_BlDPgUB4XUJwJgh7oyliGBFASQLAXR1i4"
+
+GRAPHQL_QUERY = """{{
+    searchByStore (
+        search_term: [], numericFilters: [], sortBy: "",
+        query: "{query}",
+        paginate: {{page: 0, limit: {limit}}},
+        store_id: 1
+    ) {{
+        pagination {{limit, page, total}}
+        products {{
+            name url_key sku brand
+            price special_price deal_price final_price original_price
+            image_thumbnail image_thumbnail_path
+            stock {{in_stock quantity}}
+            product_rating {{
+                quality {{average number_of_ratings}}
+            }}
+            seller {{name is_konga is_premium}}
+            is_official_store_product
+        }}
+    }}
+}}"""
+
 
 class KongaScraper(BaseScraper):
 
     SOURCE_NAME = "konga"
     PROFILE = "konga"
-
-    # Konga has changed their class names over time.
-    # We try multiple patterns — first hit wins.
-    SELECTORS = {
-        "product_card": [
-            "div[class*='product-card']",
-            "div[class*='ProductCard']",
-            "div[class*='product-list'] > div",
-            "section[class*='product'] > div",
-            "[data-testid='product-card']",
-            "div.col-xs-6",
-            "div.col-sm-4",
-        ],
-        "title": [
-            "[class*='product-title']",
-            "[class*='ProductTitle']",
-            "h3[class*='title']",
-            "p[class*='title']",
-            "a[class*='title']",
-        ],
-        "price": [
-            "[class*='price']:not([class*='old']):not([class*='strike'])",
-            "span[class*='Price']",
-            "[class*='product-price']",
-            "span.currency",
-        ],
-        "old_price": [
-            "[class*='old-price']",
-            "[class*='strike']",
-            "[class*='OldPrice']",
-        ],
-        "rating": [
-            "[class*='rating']",
-            "[class*='star']",
-            "[aria-label*='rating']",
-        ],
-        "image": [
-            "img[class*='product']",
-            "img[class*='thumbnail']",
-            "div[class*='image'] img",
-            "figure img",
-        ],
-        "link": [
-            "a[href*='/product/']",
-            "a[href*='/catalog/']",
-            "a[class*='product']",
-        ],
-    }
+    SELECTORS = {}  # Not used — API-based scraper
 
     def search(self, query: str, max_results: int = 10) -> list[Product]:
-        url = f"{KONGA_BASE}/search?search={quote_plus(query)}&page=1"
         logger.info(f"[Konga] Searching: {query}")
 
-        html = self._fetch_with_retry(url)
-        if not html:
-            logger.error(f"[Konga] No HTML for query: {query}")
+        # Primary: GraphQL
+        products = self._search_graphql(query, max_results)
+        if products:
+            logger.info(f"[Konga] Found {len(products)} products via GraphQL")
+            return products
+
+        # Fallback: KSS Igbimo
+        logger.info("[Konga] GraphQL empty → trying KSS API")
+        products = self._search_kss(query, max_results)
+        if products:
+            logger.info(f"[Konga] Found {len(products)} products via KSS")
+            return products
+
+        logger.warning("[Konga] Both APIs returned 0 results")
+        return []
+
+    # ── GraphQL API ───────────────────────────────────────────
+
+    def _search_graphql(self, query: str, max_results: int) -> list[Product]:
+        gql_body = GRAPHQL_QUERY.format(
+            query=query.replace('"', '\\"'),
+            limit=max_results,
+        )
+        payload = {"query": gql_body}
+        headers = {
+            "Content-Type":  "application/json",
+            "x-app-source":  "kongavthree",
+            "x-app-version": "2.0",
+            "Referer":       f"{KONGA_BASE}/",
+            "Origin":        KONGA_BASE,
+            "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        }
+        try:
+            resp = req.post(GRAPHQL_URL, json=payload, headers=headers, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+
+            items = (
+                data.get("data", {})
+                    .get("searchByStore", {})
+                    .get("products", [])
+            )
+            if not items:
+                logger.debug(f"[Konga][GraphQL] Response keys: {list(data.keys())}")
+                return []
+
+            return [p for p in (self._from_graphql(item) for item in items) if p]
+
+        except Exception as e:
+            logger.error(f"[Konga][GraphQL] {e}")
             return []
 
-        products = self._parse_html(html, max_results)
-        logger.info(f"[Konga] Found {len(products)} products")
-        return products
-
-    def _parse_html(self, html: str, max_results: int) -> list[Product]:
-        soup = BeautifulSoup(html, "html.parser")
-
-        # Try each card selector
-        cards = self.try_selectors_all(soup, self.SELECTORS["product_card"])
-        if not cards:
-            logger.warning("[Konga] No product cards — selectors may be stale")
-            return []
-
-        products = []
-        for card in cards[:max_results]:
-            try:
-                p = self._parse_card(card)
-                if p:
-                    products.append(p)
-            except Exception as e:
-                logger.debug(f"[Konga] Card parse error: {e}")
-                continue
-
-        return products
-
-    def _parse_card(self, card) -> Optional[Product]:
-        # Title
-        title_el = self.try_selectors(card, self.SELECTORS["title"])
-        if not title_el:
-            return None
-        title = title_el.get_text(strip=True)
+    def _from_graphql(self, item: dict) -> Optional[Product]:
+        title = (item.get("name") or "").strip()
         if not title:
             return None
 
-        # Link
-        link_el = self.try_selectors(card, self.SELECTORS["link"])
-        if not link_el:
-            # Try parent anchor
-            link_el = card.find_parent("a") or card.find("a")
-        url = ""
-        if link_el and link_el.get("href"):
-            href = link_el["href"]
-            url = href if href.startswith("http") else urljoin(KONGA_BASE, href)
-        if not url:
+        url_key = (item.get("url_key") or "").lstrip("/")
+        if not url_key:
             return None
+        url = f"{KONGA_BASE}/product/{url_key}" if not url_key.startswith("product/") else f"{KONGA_BASE}/{url_key}"
 
-        # Price
-        price_el = self.try_selectors(card, self.SELECTORS["price"])
-        price_raw = price_el.get_text(strip=True) if price_el else ""
-        price_ngn = parse_ngn(price_raw)
-
-        # Old price
-        old_el = self.try_selectors(card, self.SELECTORS["old_price"])
-        old_price = old_el.get_text(strip=True) if old_el else ""
-
-        # Rating
-        rating_el = self.try_selectors(card, self.SELECTORS["rating"])
-        rating = None
-        if rating_el:
-            rating_text = rating_el.get_text(strip=True) or rating_el.get("aria-label", "")
-            rating = _parse_rating(rating_text)
+        # Price: use cheapest available price field
+        price_ngn = None
+        for key in ("deal_price", "special_price", "final_price", "price", "original_price"):
+            val = item.get(key)
+            if val:
+                try:
+                    price_ngn = float(val)
+                    break
+                except (TypeError, ValueError):
+                    continue
 
         # Image
-        img_el = self.try_selectors(card, self.SELECTORS["image"])
-        image_url = None
-        if img_el:
-            image_url = (
-                img_el.get("data-src")
-                or img_el.get("data-lazy-src")
-                or img_el.get("src")
-            )
-            # Filter out data:image placeholder
-            if image_url and image_url.startswith("data:"):
-                image_url = None
+        img = item.get("image_thumbnail_path") or item.get("image_thumbnail") or ""
+        if img and not img.startswith("http"):
+            img = f"https://www.konga.com/media/catalog/product{img}"
+
+        # Stock
+        stock = item.get("stock") or {}
+        in_stock = stock.get("in_stock", True)
+        availability = "in_stock" if in_stock else "out_of_stock"
+
+        # Rating
+        rating = None
+        rating_data = (item.get("product_rating") or {}).get("quality") or {}
+        try:
+            avg = float(rating_data.get("average") or 0)
+            if 0 < avg <= 5:
+                rating = round(avg, 1)
+        except (TypeError, ValueError):
+            pass
+
+        review_count = None
+        try:
+            review_count = int(rating_data.get("number_of_ratings") or 0) or None
+        except (TypeError, ValueError):
+            pass
 
         return Product(
             title=title,
             source=self.SOURCE_NAME,
             url=url,
             price_ngn=price_ngn,
-            price_raw=price_raw,
+            price_raw=f"₦{price_ngn:,.2f}" if price_ngn else "",
             currency="NGN",
             rating=rating,
-            image_url=image_url,
-            availability="in_stock" if price_ngn else "unknown",
-            fetched_via="scraperapi",
-            extra={"old_price": old_price},
+            review_count=review_count,
+            image_url=img or None,
+            availability=availability,
+            fetched_via="konga_graphql",
         )
 
+    # ── KSS Igbimo fallback API ───────────────────────────────
 
-# ── Helpers ───────────────────────────────────────────────────
+    def _search_kss(self, query: str, max_results: int) -> list[Product]:
+        payload = {
+            "name":       "catalog_store_konga_ranking",
+            "q":          query,
+            "page":       1,
+            "hitPerPage": max_results,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "kss-api-key":  KSS_API_KEY,
+            "Referer":      f"{KONGA_BASE}/",
+            "Origin":       KONGA_BASE,
+            "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        }
+        try:
+            resp = req.post(KSS_URL, json=payload, headers=headers, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
 
-def _parse_rating(s: str) -> Optional[float]:
-    m = re.search(r"(\d+\.?\d*)", s)
-    v = float(m.group(1)) if m else None
-    return v if v and v <= 5.0 else None
+            # KSS response: {"status":..., "data": [...], "suggestions": [...]}
+            items = data.get("data") or []
+            if isinstance(items, dict):
+                items = items.get("products") or items.get("hits") or []
+
+            if not items:
+                logger.debug(f"[Konga][KSS] Response keys: {list(data.keys())}")
+                return []
+
+            return [p for p in (self._from_kss(item) for item in items) if p]
+
+        except Exception as e:
+            logger.error(f"[Konga][KSS] {e}")
+            return []
+
+    def _from_kss(self, item: dict) -> Optional[Product]:
+        title = (item.get("name") or "").strip()
+        if not title:
+            return None
+
+        url_key = (item.get("url_key") or "").lstrip("/")
+        if not url_key:
+            return None
+        url = f"{KONGA_BASE}/product/{url_key}" if not url_key.startswith("product/") else f"{KONGA_BASE}/{url_key}"
+
+        price_ngn = None
+        for key in ("price", "deal_price", "special_price"):
+            val = item.get(key)
+            if val:
+                try:
+                    price_ngn = float(val)
+                    break
+                except (TypeError, ValueError):
+                    pass
+
+        img = item.get("image_thumbnail") or item.get("thumbnail") or ""
+        if img and not img.startswith("http"):
+            img = f"https://www.konga.com/media/catalog/product{img}"
+
+        return Product(
+            title=title,
+            source=self.SOURCE_NAME,
+            url=url,
+            price_ngn=price_ngn,
+            price_raw=f"₦{price_ngn:,.2f}" if price_ngn else "",
+            currency="NGN",
+            image_url=img or None,
+            availability="in_stock",
+            fetched_via="konga_kss",
+        )
+
+    # ── Required abstract stubs ───────────────────────────────
+
+    def _parse_html(self, html: str, max_results: int) -> list[Product]:
+        # Not used — this scraper is API-only
+        return []
