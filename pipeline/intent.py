@@ -24,10 +24,10 @@ logger = logging.getLogger(__name__)
 
 # ── Category keyword table ────────────────────────────────────
 _CATEGORIES = {
-    "phone":       ["phone", "iphone", "samsung", "tecno", "infinix", "smartphone", "android"],
-    "laptop":      ["laptop", "notebook", "macbook", "chromebook", "pc", "computer"],
-    "tablet":      ["tablet", "ipad", "tab"],
-    "tv":          ["tv", "television", "smart tv", "led tv", "oled"],
+    "phone":       ["phone", "iphone", "samsung", "tecno", "infinix", "smartphone", "android", "itel", "xiaomi", "redmi", "oppo", "pixel", "galaxy"],
+    "laptop":      ["laptop", "notebook", "macbook", "chromebook", "pc", "computer", "thinkpad", "hp pavillion", "dell latitude", "asus rog"],
+    "tablet":      ["tablet", "ipad", "tab", "surface pro"],
+    "tv":          ["tv", "television", "smart tv", "led tv", "oled", "hisense", "lg tv"],
     "blender":     ["blender", "mixer", "food processor", "juicer"],
     "fridge":      ["fridge", "refrigerator", "freezer", "cooler"],
     "ac":          ["air conditioner", "air con", "ac unit", "split unit"],
@@ -211,9 +211,15 @@ class _RuleParser:
         )
 
     def _detect_category(self, q: str) -> Optional[str]:
+        # Pre-process query to strip out specific punctuation that fragments model numbers
+        normalized_q = re.sub(r'[-–—/]', ' ', q.lower())
+
         for cat, keywords in _CATEGORIES.items():
             for kw in keywords:
-                if kw in q:
+                # Use regex word boundaries (\b) so 'ipad' doesn't match accidental substrings,
+                # but matches cleanly when surrounded by whitespace, numbers, or end-of-strings.
+                pattern = rf"\b{re.escape(kw)}\b"
+                if re.search(pattern, normalized_q):
                     return cat
         return None
 
