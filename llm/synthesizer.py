@@ -25,7 +25,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-HF_ENDPOINT = "https://api-inference.huggingface.co/v1/chat/completions"
+HF_ENDPOINT = "https://router.huggingface.co/v1/chat/completions"
 
 # ── Prompts ───────────────────────────────────────────────────
 
