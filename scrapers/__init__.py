@@ -18,9 +18,9 @@ from .temu import TemuScraper
 # ── Registry: name → class ─────────────────────────────────
 REGISTRY: dict[str, type[BaseScraper]] = {
     "jumia": JumiaScraper,
-    "jiji":  JijiScraper,
-    "konga": KongaScraper,
-    "slot":  SlotScraper,
+    # "jiji":  JijiScraper,
+    # "konga": KongaScraper,
+    # "slot":  SlotScraper,
     # "temu":  TemuScraper,
 }
 

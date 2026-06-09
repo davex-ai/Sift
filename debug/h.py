@@ -1,60 +1,115 @@
-# import os
-#
-#
-# def combine_py_files(root_dir, output_file, skip_dirs=None, skip_files=None):
-#     """
-#     Reads only .py files and adds their file name/path to the top of their content.
-#     """
-#     skip_dirs = skip_dirs or []
-#     skip_files = skip_files or []
-#
-#     with open(output_file, 'w', encoding='utf-8') as outfile:
-#         for root, dirs, files in os.walk(root_dir):
-#             # Exclude specific subfolders from the walk
-#             dirs[:] = [d for d in dirs if d not in skip_dirs]
-#
-#             for filename in files:
-#                 # Filter for .py files only
-#                 # if not filename.endswith('.ts'):
-#                 #     continue
-#
-#                 # Skip explicit files or the output file itself
-#                 if filename in skip_files or filename == output_file:
-#                     continue
-#
-#                 file_path = os.path.join(root, filename)
-#
-#                 # HEADER: Writing file name and path at the top of the code
-#                 outfile.write(f"\n{'#' * 80}\n")
-#                 outfile.write(f"# FILE NAME: {filename}\n")
-#                 outfile.write(f"# FULL PATH: {file_path}\n")
-#                 outfile.write(f"{'#' * 80}\n\n")
-#
-#                 try:
-#                     # Open in read-only mode ('r')
-#                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as infile:
-#                         outfile.write(infile.read())
-#                 except Exception as e:
-#                     outfile.write(f"# [Error reading file: {e}]\n")
-#
-#                 # Add a few line breaks between files for readability
-#                 outfile.write("\n\n")
-#
-#
-# if __name__ == "__main__":
-#     # --- Configuration ---
-#     # Using 'r' for raw string to handle Windows backslashes correctly
-#     target_path = r"C:\Users\DELL\Documents\Hunger Games\archon-backend"
-#     result_file = "all_py_code_combined.txt"
-#
-#     # Folders and Files to ignore
-#     exclude_folders = ['.git', 'node_modules', '__pycache__', '.venv', 'backend-stg-0', '.idea']
-#     exclude_filenames = ['h.py', 'data.py', '.gitignore', 'secrets.env', 'package.json', 'package-lock.json', 'sp500_tickers.csv', '.env', '*.md']
-#
-#     print(f"Reading .py files in {os.path.abspath(target_path)}...")
-#     combine_py_files(target_path, result_file, exclude_folders, exclude_filenames)
-#     print(f"Success! All Python code combined into: {result_file}")
+import fnmatch
+import os
 
+
+def combine_all_files(root_dir, output_file, skip_dirs=None, skip_files=None):
+    """
+    Combines all files except those matching skip_dirs or skip_files using wildcards.
+    """
+    skip_dirs = skip_dirs or []
+    skip_files = skip_files or []
+
+    # CRITICAL FIX 1: Explicitly clear/delete the old combined file if it already exists
+    # This prevents old data from being appended or lingering between runs
+    if os.path.exists(output_file):
+        try:
+            os.remove(output_file)
+        except Exception as e:
+            print(f"Warning: Could not clear old file: {e}")
+
+    with open(output_file, 'w', encoding='utf-8') as outfile:
+        for root, dirs, files in os.walk(root_dir):
+
+            # Filter folders using wildcard patterns
+            valid_dirs = []
+            for d in dirs:
+                should_skip_dir = False
+                for pattern in skip_dirs:
+                    if fnmatch.fnmatch(d, pattern):
+                        should_skip_dir = True
+                        break
+                if not should_skip_dir:
+                    valid_dirs.append(d)
+            dirs[:] = valid_dirs
+
+            for filename in files:
+                # Always skip the output text file itself to prevent infinite parsing loops
+                if filename == output_file or filename == os.path.basename(output_file):
+                    continue
+
+                # FIX 2: Check filename against exclusion patterns case-insensitively
+                should_skip = False
+                for pattern in skip_files:
+                    if fnmatch.fnmatch(filename.lower(), pattern.lower()):
+                        should_skip = True
+                        break
+
+                if should_skip:
+                    continue
+
+                file_path = os.path.join(root, filename)
+
+                # HEADER: Writing file name and path at the top of the content
+                outfile.write(f"\n{'#' * 80}\n")
+                outfile.write(f"# FILE NAME: {filename}\n")
+                outfile.write(f"# FULL PATH: {file_path}\n")
+                outfile.write(f"{'#' * 80}\n\n")
+
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as infile:
+                        outfile.write(infile.read())
+                except Exception as e:
+                    outfile.write(f"# [Error reading file: {e}]\n")
+
+                # Add a few line breaks between files for readability
+                outfile.write("\n\n")
+
+
+if __name__ == "__main__":
+    target_path = r"C:\Users\DELL\IdeaProjects\SPRING-CLASS\06 DISTRIBUTED TRACING"
+    result_file = "all_project_code_combined.txt"
+
+    # Folders to ignore
+    exclude_folders = [
+        '.git',
+        '.idea',
+        '.venv',
+        '__pycache__',
+        'node_modules',
+        'target',
+        'debug',
+        'backend-stg-0',
+        '.*',  # Ignore hidden folders
+    ]
+
+    # Files to ignore (Now optimized for files without extensions like mvnw)
+    exclude_filenames = [
+        '.*',  # Ignores all hidden files (.gitignore, .env)
+        '*docker*',  # Ignores any docker configurations
+        '*mvnw*',  # FIX 3: Catches "mvnw", "mvnw.cmd", and maven wrappers as files
+        'pom.xml',
+        'h.py',
+        'data.py',
+        'secrets.env',
+        'package.json',
+        'package-lock.json',
+        'sp500_tickers.csv',
+        '*.md',
+        '*.db',
+        '*.json',
+        '*.html',
+        '*.txt',
+        '*.png',
+        '*.jpg',
+        '*.ico',
+        '*.class',
+        '*.jar',
+        '*.cmd'  # Blocks Windows command scripts often paired with maven wrappers
+    ]
+
+    print(f"Combining allowed files in {os.path.abspath(target_path)}...")
+    combine_all_files(target_path, result_file, exclude_folders, exclude_filenames)
+    print(f"Success! Old files cleared. Everything combined into: {result_file}")
 
 # konga_debug.py  — run once, then never again
 # Captures every network request Konga makes when you search
@@ -174,86 +229,86 @@
 
 
 
-import re
-from bs4 import BeautifulSoup
+# import re
+# from bs4 import BeautifulSoup
 
 
-def parse_html(html_content):
-    soup = BeautifulSoup(html_content, "html.parser")
-    products = []
+# def parse_html(html_content):
+#     soup = BeautifulSoup(html_content, "html.parser")
+#     products = []
 
-    # --- SCENARIO A: Extracting from the Live Search Dropdown Box ---
-    # The drop-down results container sits right below the search form
-    dropdown_container = soup.find(
-        "div", class_=lambda c: c and "absolute" in c and "max-h-95" in c
-    )
+#     # --- SCENARIO A: Extracting from the Live Search Dropdown Box ---
+#     # The drop-down results container sits right below the search form
+#     dropdown_container = soup.find(
+#         "div", class_=lambda c: c and "absolute" in c and "max-h-95" in c
+#     )
 
-    if dropdown_container:
-        # Find individual rows inside the search dropdown
-        items = dropdown_container.find_all(
-            "div", class_=lambda c: c and "cursor-pointer" in c
-        )
-        for item in items:
-            title_tag = item.find(
-                "div", class_=lambda c: c and "truncate" in c
-            )
-            price_tag = item.find(
-                "div", class_=lambda c: c and "text-red-600" in c
-            )
-            img_tag = item.find("img")
+#     if dropdown_container:
+#         # Find individual rows inside the search dropdown
+#         items = dropdown_container.find_all(
+#             "div", class_=lambda c: c and "cursor-pointer" in c
+#         )
+#         for item in items:
+#             title_tag = item.find(
+#                 "div", class_=lambda c: c and "truncate" in c
+#             )
+#             price_tag = item.find(
+#                 "div", class_=lambda c: c and "text-red-600" in c
+#             )
+#             img_tag = item.find("img")
 
-            if title_tag and price_tag:
-                products.append(
-                    {
-                        "source": "search_dropdown",
-                        "title": title_tag.get_text(strip=True),
-                        "price": price_tag.get_text(strip=True),
-                        "image": img_tag.get("src") if img_tag else None,
-                    }
-                )
+#             if title_tag and price_tag:
+#                 products.append(
+#                     {
+#                         "source": "search_dropdown",
+#                         "title": title_tag.get_text(strip=True),
+#                         "price": price_tag.get_text(strip=True),
+#                         "image": img_tag.get("src") if img_tag else None,
+#                     }
+#                 )
 
-    # --- SCENARIO B: Extracting from Main Shop Grid (Product Cards) ---
-    # The actual product cards on the shop page use a group flex layout wrapper
-    grid_cards = soup.find_all(
-        "div", class_=lambda c: c and "group" in c and "flex-col" in c
-    )
+#     # --- SCENARIO B: Extracting from Main Shop Grid (Product Cards) ---
+#     # The actual product cards on the shop page use a group flex layout wrapper
+#     grid_cards = soup.find_all(
+#         "div", class_=lambda c: c and "group" in c and "flex-col" in c
+#     )
 
-    for card in grid_cards:
-        # Avoid catching elements that aren't product listings
-        link_tag = card.find("a", href=re.compile(r"^/products/"))
-        if not link_tag:
-            continue
+#     for card in grid_cards:
+#         # Avoid catching elements that aren't product listings
+#         link_tag = card.find("a", href=re.compile(r"^/products/"))
+#         if not link_tag:
+#             continue
 
-        img_tag = link_tag.find("img")
-        title = img_tag.get("alt") if img_tag else None
+#         img_tag = link_tag.find("img")
+#         title = img_tag.get("alt") if img_tag else None
 
-        # Price is nested safely inside the flex column text-red section
-        price_tag = card.find("span", class_=lambda c: c and "text-red-600" in c)
+#         # Price is nested safely inside the flex column text-red section
+#         price_tag = card.find("span", class_=lambda c: c and "text-red-600" in c)
 
-        if title and price_tag:
-            products.append(
-                {
-                    "source": "shop_grid",
-                    "title": title.strip(),
-                    "price": price_tag.get_text(strip=True),
-                    "image": img_tag.get("src") if img_tag else None,
-                }
-            )
+#         if title and price_tag:
+#             products.append(
+#                 {
+#                     "source": "shop_grid",
+#                     "title": title.strip(),
+#                     "price": price_tag.get_text(strip=True),
+#                     "image": img_tag.get("src") if img_tag else None,
+#                 }
+#             )
 
-    return products
+#     return products
 
 
-# Test snippet execution
-if __name__ == "__main__":
-    with open("slot_debug.html", "r", encoding="utf-8") as f:
-        html_data = f.read()
+# # Test snippet execution
+# if __name__ == "__main__":
+#     with open("slot_debug.html", "r", encoding="utf-8") as f:
+#         html_data = f.read()
 
-    extracted_items = parse_html(html_data)
-    print(f"Successfully extracted {len(extracted_items)} items:")
-    for idx, prod in enumerate(extracted_items, 1):
-        print(
-            f"[{prod['source'].upper()}] {idx}. {prod['title']} -> {prod['price']}"
-        )
+#     extracted_items = parse_html(html_data)
+#     print(f"Successfully extracted {len(extracted_items)} items:")
+#     for idx, prod in enumerate(extracted_items, 1):
+#         print(
+#             f"[{prod['source'].upper()}] {idx}. {prod['title']} -> {prod['price']}"
+#         )
 
 
 

@@ -39,6 +39,7 @@ def run_test(query: str = "best blender under 50000") -> None:
 
     pipeline = ShoppingPipeline()
     groups, intent = pipeline.search(query)
+    save_search_event()
 
     if not groups:
         print("❌ No results found.")
