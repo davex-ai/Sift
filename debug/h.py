@@ -20,7 +20,7 @@ def combine_all_files(root_dir, output_file, skip_dirs=None, skip_files=None):
     with open(output_file, 'w', encoding='utf-8') as outfile:
         for root, dirs, files in os.walk(root_dir):
 
-            # Filter folders using wildcard patterns
+            
             valid_dirs = []
             for d in dirs:
                 should_skip_dir = False
