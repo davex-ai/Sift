@@ -1,8 +1,5 @@
 """
-Telegram Bot — application setup and startup.
-
-Registers handlers, starts the alert checker scheduler,
-then runs the bot in polling mode.
+bot/telegram_bot.py — updated to register /admin command
 """
 
 import logging
@@ -16,11 +13,11 @@ from telegram.ext import (
 )
 
 from bot.handlers import (
-    cmd_start, cmd_help, cmd_alerts, cmd_cancel,
+    cmd_start, cmd_help, cmd_alerts, cmd_cancel, cmd_admin,
     handle_message, handle_callback, error_handler,
     get_pipeline,
 )
-from db.models import init_db, get_active_alerts, session_scope, PriceAlert
+from db.models import init_db, session_scope, PriceAlert
 from bot.formatter import format_alert_triggered
 from utils.currency import format_ngn
 import config
@@ -28,41 +25,25 @@ import config
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════
-# Alert checker
-# ══════════════════════════════════════════════════════════════
-
 async def run_alert_check(app: Application) -> None:
-    """
-    Periodically check all active alerts.
-    For each alert: scrape the product, compare to threshold, notify if triggered.
-    Runs every 6 hours.
-    """
     logger.info("[Alerts] Starting alert checker")
-
     while True:
         try:
             await _check_alerts(app)
         except Exception as e:
             logger.error(f"[Alerts] Checker error: {e}")
-
-        # Sleep 6 hours between checks
         await asyncio.sleep(6 * 3600)
 
 
 async def _check_alerts(app: Application) -> None:
-    """One round of alert checking."""
     with session_scope() as db:
         active = db.query(PriceAlert).filter_by(is_active=True).all()
-
     if not active:
         return
 
     logger.info(f"[Alerts] Checking {len(active)} active alerts")
     pipeline = get_pipeline()
-
-    # Group alerts by product title to avoid duplicate scrapes
-    checked: dict[str, list] = {}  # product_title → groups
+    checked: dict[str, list] = {}
 
     for alert in active:
         title = alert.product_title or ""
@@ -83,23 +64,18 @@ async def _check_alerts(app: Application) -> None:
         if not groups:
             continue
 
-        # Find the product group matching this alert
         matching = next(
             (g for g in groups if g.id == alert.product_id),
-            groups[0],  # fallback to top result
+            groups[0],
         )
-
         if not matching.lowest_price:
             continue
 
-        # Check if threshold met
         if matching.lowest_price <= alert.threshold_ngn:
             best_source = next(
                 (s for s in matching.sources if s.price_ngn == matching.lowest_price),
                 matching.sources[0],
             )
-
-            # Send alert
             try:
                 msg = format_alert_triggered(
                     product_title=matching.canonical_title,
@@ -114,44 +90,27 @@ async def _check_alerts(app: Application) -> None:
                     parse_mode="Markdown",
                     disable_web_page_preview=True,
                 )
-                logger.info(
-                    f"[Alerts] Triggered for user {alert.user_id}: "
-                    f"{matching.canonical_title} @ {format_ngn(matching.lowest_price)}"
-                )
-
-                # Mark as triggered
+                logger.info(f"[Alerts] Triggered for user {alert.user_id}: {matching.canonical_title}")
                 with session_scope() as db:
                     a = db.query(PriceAlert).filter_by(id=alert.id).first()
                     if a:
                         a.triggered_at = datetime.utcnow()
                         a.is_active = False
-
             except Exception as e:
                 logger.error(f"[Alerts] Send failed to {alert.user_id}: {e}")
 
 
-# ══════════════════════════════════════════════════════════════
-# Bot setup
-# ══════════════════════════════════════════════════════════════
-
 def build_application() -> Application:
-    """Create and configure the Telegram Application."""
     if not config.TELEGRAM_BOT_TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN not set. Add it to your .env file."
-        )
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set.")
 
-    app = (
-        Application.builder()
-        .token(config.TELEGRAM_BOT_TOKEN)
-        .build()
-    )
+    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 
-    # Register handlers
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_help))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("admin",  cmd_admin))   # ← new
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
@@ -160,30 +119,20 @@ def build_application() -> Application:
 
 
 async def post_init(app: Application) -> None:
-    """Run after bot starts — set commands, start background tasks."""
-    # Set bot command list (shows in Telegram UI)
     await app.bot.set_my_commands([
         BotCommand("start",  "Welcome message"),
         BotCommand("help",   "How to use Sift"),
-        BotCommand("alerts", "View your price alerts"),
+        BotCommand("alerts", "Your price alerts"),
         BotCommand("cancel", "Cancel current action"),
     ])
-
-    # Start alert checker in background
     asyncio.create_task(run_alert_check(app))
-
     logger.info("[Bot] Sift is online ✅")
 
 
 def run_bot() -> None:
-    """Entry point — blocks until process is killed."""
-    # Init DB
     init_db()
-
-    # Build app
     app = build_application()
     app.post_init = post_init
-
     logger.info("[Bot] Starting polling...")
     app.run_polling(
         allowed_updates=["message", "callback_query"],
