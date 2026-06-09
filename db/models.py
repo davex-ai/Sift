@@ -131,6 +131,25 @@ class ScraperHealth(Base):
         Index("ix_health_checked_at", "checked_at"),
     )
 
+class SearchEvent(Base):
+    __tablename__ = "search_event"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False)
+    query = Column(String(200))
+    clean_query = Column(String(200))
+    category = Column(String(100))
+    result_count = Column(Integer, default=0)
+    stores_used = Column(String(200))  # "jumia,konga,jiji"
+    response_time_ms = Column(Integer)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+class UserRecord(Base):
+    __tablename__ = "user_record"
+    telegram_id = Column(Integer, primary_key=True)
+    username = Column(String(100))
+    first_seen = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    search_count = Column(Integer, default=0)
 
 # ══════════════════════════════════════════════════════════════
 # Engine + session factory
