@@ -1,19 +1,11 @@
 """
-ShoppingPipeline — Perplexity-style research orchestrator.
 
-Flow:
-  User query
-    → IntentParser (extract budget, category, clean query)
-    → Check cache (return instantly if fresh)
-    → Parallel scrape all enabled stores
-        ├── ScraperAPI (primary)
-        └── Playwright fallback
-    → Normalizer (dedup + cross-store grouping + scoring)
-    → LLM synthesis (Qwen recommendation)
-    → Return ranked ProductGroups + LLM text
-
-Like Perplexity: search everywhere simultaneously,
-then synthesize a single coherent answer.
+Changes from previous version:
+  - Cache key now uses intent.cache_key() (hashes query + budget + brand + stores)
+    instead of just intent.clean_query — prevents wrong cached results
+  - Candidate terms: if canonical returns < 3 results, searches candidate_terms too
+  - should_search() check: if LLM says ask, pipeline returns empty + question instead of searching
+  - normalizer.normalize() now receives budget_min_ngn from intent
 """
 
 import logging
@@ -22,39 +14,34 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
+from db import save_price_snapshots
 from scrapers import build_scrapers
 from scrapers.base import Product
 from normalizer.core import Normalizer
 from normalizer.dedup import ProductGroup
-from pipeline.intent import IntentParser, SearchIntent
+from pipeline.intent import IntentParser, ParsedIntent
 from db.cache import QueryCache
 import config
 
 logger = logging.getLogger(__name__)
 
+# Sentinel returned when bot should ask a clarification question
+# instead of searching. Handlers check for this.
+NEEDS_CLARIFICATION = "__needs_clarification__"
+
 
 class ShoppingPipeline:
-    """
-    Main search pipeline.
-    Async-compatible: async search() wraps sync work in thread pool.
-    """
 
-    def __init__(
-        self,
-        scraperapi_key: Optional[str] = None,
-        use_playwright: bool = True,
-    ):
+    def __init__(self, scraperapi_key=None, use_playwright=True):
         self.scrapers = build_scrapers(
             scraperapi_key=scraperapi_key,
             use_playwright=use_playwright,
         )
-        self.normalizer = Normalizer()
+        self.normalizer   = Normalizer()
         self.intent_parser = IntentParser()
-        self.cache = QueryCache()
+        self.cache        = QueryCache()
 
-        logger.info(
-            f"[Pipeline] Initialized with scrapers: {list(self.scrapers.keys())}"
-        )
+        logger.info(f"[Pipeline] Initialized with scrapers: {list(self.scrapers.keys())}")
 
     # ── Public API ────────────────────────────────────────────
 
@@ -62,12 +49,8 @@ class ShoppingPipeline:
         self,
         query: str,
         top_n: int = config.TOP_N_RESULTS,
-        sources: Optional[list[str]] = None,
-    ) -> tuple[list[ProductGroup], SearchIntent]:
-        """
-        Async entry point for the Telegram bot.
-        Runs blocking scrape work in a thread pool.
-        """
+        sources: Optional[list] = None,
+    ) -> tuple[list[ProductGroup], ParsedIntent]:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             None,
@@ -78,24 +61,31 @@ class ShoppingPipeline:
         self,
         query: str,
         top_n: int = config.TOP_N_RESULTS,
-        sources: Optional[list[str]] = None,
-    ) -> tuple[list[ProductGroup], SearchIntent]:
-        """
-        Sync search. Returns (ranked groups, parsed intent).
-        """
+        sources: Optional[list] = None,
+    ) -> tuple[list[ProductGroup], ParsedIntent]:
         t0 = time.monotonic()
 
         # 1. Parse intent
         intent = self.intent_parser.parse(query)
-        logger.info(f"[Pipeline] Query: '{query}' → {intent}")
+        logger.info(f"[Pipeline] '{query}' → {intent}")
 
-        # 2. Check cache
-        cached = self.cache.get(intent.clean_query)
+        # 2. Cost model check — if LLM says ask, don't search yet
+        #    Handlers detect empty groups + intent.needs_clarification
+        if intent.needs_clarification and not intent.should_search():
+            logger.info(
+                f"[Pipeline] Ambiguity={intent.ambiguity:.2f} > threshold — "
+                f"returning clarification request: '{intent.clarification_question}'"
+            )
+            return [], intent
+
+        # 3. Check cache — keyed on query + budget + brand + stores
+        cache_key = intent.cache_key()
+        cached = self.cache.get(cache_key)
         if cached is not None:
-            logger.info("[Pipeline] Cache hit — returning instantly")
+            logger.info(f"[Pipeline] Cache hit ({cache_key})")
             return cached, intent
 
-        # 3. Select scrapers
+        # 4. Select scrapers
         active_scrapers = {
             name: s
             for name, s in self.scrapers.items()
@@ -106,21 +96,42 @@ class ShoppingPipeline:
             logger.warning("[Pipeline] No active scrapers match request")
             return [], intent
 
-        # 4. Parallel scrape
+        # 5. Primary search with canonical term
         all_products = self._scrape_parallel(
-            intent.clean_query,
+            intent.canonical_search_term,
             active_scrapers,
         )
+
+        # 6. Candidate fallback — if canonical returned very few results,
+        #    search the alternative terms and merge
+        if len(all_products) < 3 and len(intent.candidate_terms) > 1:
+            logger.info(
+                f"[Pipeline] Only {len(all_products)} results from canonical — "
+                f"trying {len(intent.candidate_terms)-1} candidate terms"
+            )
+            seen_urls = {p.url for p in all_products}
+            for candidate in intent.candidate_terms[1:]:
+                if candidate == intent.canonical_search_term:
+                    continue
+                candidate_products = self._scrape_parallel(candidate, active_scrapers)
+                new_products = [p for p in candidate_products if p.url not in seen_urls]
+                if new_products:
+                    logger.info(f"[Pipeline] Candidate '{candidate}' added {len(new_products)} products")
+                    all_products.extend(new_products)
+                    seen_urls.update(p.url for p in new_products)
+                if len(all_products) >= 5:
+                    break  # enough — don't over-query
 
         if not all_products:
             logger.warning("[Pipeline] Zero results from all scrapers")
             return [], intent
 
-        # 5. Normalize + rank
+        # 7. Normalize + rank
         groups = self.normalizer.normalize(
             all_products,
-            query=intent.clean_query,
+            query=intent.canonical_search_term,
             budget_ngn=intent.budget_ngn,
+            budget_min_ngn=intent.budget_min_ngn,
             top_n=top_n,
         )
 
@@ -130,8 +141,9 @@ class ShoppingPipeline:
             f"{len(all_products)} products → {len(groups)} groups"
         )
 
-        # 6. Cache result
-        self.cache.set(intent.clean_query, groups)
+        # 8. Cache result with rich key
+        self.cache.set(cache_key, groups)
+        save_price_snapshots(groups)
 
         return groups, intent
 
@@ -147,8 +159,6 @@ class ShoppingPipeline:
                 for name, scraper in scrapers.items()
             }
             try:
-                # as_completed processes each result the moment it arrives
-                # timeout=150 gives ScraperAPI(55s) + Playwright(60s) room to breathe
                 for future in as_completed(futures, timeout=150):
                     store = futures[future]
                     try:
@@ -156,14 +166,10 @@ class ShoppingPipeline:
                         count = len(products)
                         logger.info(f"[Pipeline] {store}: {count} results")
                         if count == 0 and config.ALERT_ON_ZERO_RESULTS:
-                            logger.warning(
-                                f"[Pipeline] ⚠️  {store} returned 0 results — "
-                                "selector may be stale"
-                            )
+                            logger.warning(f"[Pipeline] ⚠️ {store} returned 0 results")
                         all_products.extend(products)
                     except Exception as e:
                         logger.error(f"[Pipeline] {store} failed: {e}")
-
             except TimeoutError:
                 remaining = [futures[f] for f in futures if not f.done()]
                 logger.warning(f"[Pipeline] Timed out waiting for: {remaining}")
@@ -171,24 +177,17 @@ class ShoppingPipeline:
         return all_products
 
     def _scrape_one(self, name: str, scraper, query: str) -> list[Product]:
-        """Single scraper call with per-store error isolation."""
         try:
             return scraper.search(query, max_results=config.MAX_RESULTS_PER_STORE)
         except Exception as e:
             logger.error(f"[Pipeline] Scraper '{name}' raised: {e}")
             return []
 
-    # ── Runtime scraper management ────────────────────────────
-
     def add_scraper(self, name: str, scraper) -> None:
-        """Plug in a new scraper at runtime without restart."""
         self.scrapers[name] = scraper
-        logger.info(f"[Pipeline] Registered scraper: {name}")
 
     def remove_scraper(self, name: str) -> None:
         self.scrapers.pop(name, None)
-        logger.info(f"[Pipeline] Removed scraper: {name}")
 
-    def scraper_health(self) -> dict[str, str]:
-        """Return last-known status per scraper."""
+    def scraper_health(self) -> dict:
         return {name: "active" for name in self.scrapers}

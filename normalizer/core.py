@@ -94,30 +94,37 @@ class Normalizer:
             floor = budget_min * (1 - tolerance)   # 5% tolerance below min too
             result = [g for g in result if g.lowest_price is None or g.lowest_price >= floor]
         return result
-    def _filter_relevance(
-        self,
-        groups: list[ProductGroup],
-        query: str,
-    ) -> list[ProductGroup]:
-        """
-        Remove products with zero overlap with the search query.
-        'blender' query → 'Kitchen Tap' is filtered out.
-        Uses cleaned query words (2+ chars, ignoring stopwords).
-        """
+
+    def _filter_relevance(self, groups, query: str) -> list:
         from normalizer.dedup import normalize_title, _STOPWORDS
+        import re
+
         norm_query = normalize_title(query)
         query_words = [w for w in norm_query.split() if len(w) >= 3 and w not in _STOPWORDS]
 
         if not query_words:
-            return groups  # can't filter without signal
+            return groups
+
+        # Detect model numbers in query: A15, M3, G6, 840, A55, etc.
+        model_numbers = re.findall(r'\b([a-z]{0,3}\d+[a-z]{0,3}\d*)\b', norm_query)
+        model_numbers = [m for m in model_numbers if len(m) >= 2]
 
         result = []
         for g in groups:
             title_lower = normalize_title(g.canonical_title)
-            # At least one query word must appear in the title
-            if any(qw in title_lower for qw in query_words):
-                result.append(g)
-            else:
-                logger.debug(f"[Relevance] Dropped: '{g.canonical_title[:50]}'")
+
+            # Basic word overlap check
+            if not any(qw in title_lower for qw in query_words):
+                logger.debug(f"[Relevance] Dropped (no overlap): '{g.canonical_title[:50]}'")
+                continue
+
+            # If query has model numbers, at least one must match
+            if model_numbers:
+                title_models = re.findall(r'\b([a-z]{0,3}\d+[a-z]{0,3}\d*)\b', title_lower)
+                if not any(qm in title_models for qm in model_numbers):
+                    logger.debug(f"[Relevance] Dropped (model mismatch): '{g.canonical_title[:50]}'")
+                    continue
+
+            result.append(g)
         return result
 __all__ = ["Normalizer"]
