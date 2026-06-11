@@ -206,10 +206,13 @@ class JijiScraper(BaseScraper):
 
         price_el = self.try_selectors(card, self.SELECTORS["price"])
         price_raw = price_el.get_text(strip=True) if price_el else ""
-        if price_raw.lower() in ("negotiable", "call", "free", "contact"):
-            availability = "negotiable"
+        negotiable_phrases = {"negotiable", "call", "free", "contact", "on request"}
+        if price_raw.lower().strip() in negotiable_phrases:
             price_ngn = None
-        price_ngn = parse_ngn(price_raw)
+            availability = "negotiable"
+        else:
+            price_ngn = parse_ngn(price_raw)
+            availability = "in_stock" if price_ngn else "unknown"
 
         img_el = self.try_selectors(card, self.SELECTORS["image"])
         image_url = img_el.get("data-src") or img_el.get("src") if img_el else None
