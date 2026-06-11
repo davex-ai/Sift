@@ -131,25 +131,46 @@ class ScraperHealth(Base):
         Index("ix_health_checked_at", "checked_at"),
     )
 
+
 class SearchEvent(Base):
+    """One row per search. Powers the /admin analytics dashboard."""
     __tablename__ = "search_event"
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, nullable=False)
-    query = Column(String(200))
-    clean_query = Column(String(200))
+    raw_query = Column(String(300))
+    clean_query = Column(String(300))
     category = Column(String(100))
     result_count = Column(Integer, default=0)
-    stores_used = Column(String(200))  # "jumia,konga,jiji"
+    stores_searched = Column(String(200))  # comma-separated: "jumia,konga,jiji"
+    stores_returned = Column(String(200))  # stores that had results
     response_time_ms = Column(Integer)
+    parsed_by = Column(String(20))  # "rules" | "llm"
+    intent_confidence = Column(Float)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
+    __table_args__ = (
+        Index("ix_event_user", "user_id"),
+        Index("ix_event_timestamp", "timestamp"),
+        Index("ix_event_category", "category"),
+        Index("ix_event_query", "clean_query"),
+    )
+
+
 class UserRecord(Base):
+    """One row per Telegram user. Updated on every search."""
     __tablename__ = "user_record"
+
     telegram_id = Column(Integer, primary_key=True)
     username = Column(String(100))
     first_seen = Column(DateTime, default=datetime.utcnow)
-    last_seen = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow)
     search_count = Column(Integer, default=0)
+    total_results_received = Column(Integer, default=0)
+
+    __table_args__ = (
+        Index("ix_user_last_seen", "last_seen"),
+    )
 
 # ══════════════════════════════════════════════════════════════
 # Engine + session factory
@@ -191,6 +212,129 @@ def session_scope():
 # ══════════════════════════════════════════════════════════════
 # Helpers
 # ══════════════════════════════════════════════════════════════
+
+def save_search_event(
+        user_id: int,
+        raw_query: str,
+        clean_query: str,
+        category: Optional[str],
+        result_count: int,
+        stores_searched: list,
+        stores_with_results: list,
+        response_time_ms: int,
+        parsed_by: str = "rules",
+        intent_confidence: float = 1.0,
+) -> None:
+    """Record one search. Called from handlers._run_search()."""
+    try:
+        with session_scope() as db:
+            db.add(SearchEvent(
+                user_id=user_id,
+                raw_query=raw_query[:300],
+                clean_query=clean_query[:300],
+                category=category,
+                result_count=result_count,
+                stores_searched=",".join(stores_searched),
+                stores_returned=",".join(stores_with_results),
+                response_time_ms=response_time_ms,
+                parsed_by=parsed_by,
+                intent_confidence=intent_confidence,
+            ))
+    except Exception as e:
+        logger.debug(f"[Analytics] save_search_event failed: {e}")
+
+
+def upsert_user(user_id: int, username: str = "") -> None:
+    """Create or update a user record on every search."""
+    try:
+        with session_scope() as db:
+            user = db.query(UserRecord).filter_by(telegram_id=user_id).first()
+            if user:
+                user.last_seen = datetime.utcnow()
+                user.search_count += 1
+                if username:
+                    user.username = username
+            else:
+                db.add(UserRecord(
+                    telegram_id=user_id,
+                    username=username or "",
+                    first_seen=datetime.utcnow(),
+                    last_seen=datetime.utcnow(),
+                    search_count=1,
+                ))
+    except Exception as e:
+        logger.debug(f"[Analytics] upsert_user failed: {e}")
+
+
+def get_stats(days: int = 7) -> dict:
+    """
+    Return analytics summary for the /admin command.
+    Shows user counts, search volume, top categories and queries.
+    """
+    from sqlalchemy import func
+    from datetime import timedelta
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    try:
+        with session_scope() as db:
+            total_users = db.query(func.count(UserRecord.telegram_id)).scalar() or 0
+
+            active_users = (
+                    db.query(func.count(UserRecord.telegram_id))
+                    .filter(UserRecord.last_seen >= cutoff)
+                    .scalar() or 0
+            )
+            total_searches = db.query(func.count(SearchEvent.id)).scalar() or 0
+
+            recent_searches = (
+                    db.query(func.count(SearchEvent.id))
+                    .filter(SearchEvent.timestamp >= cutoff)
+                    .scalar() or 0
+            )
+            top_cats = (
+                db.query(SearchEvent.category, func.count(SearchEvent.id).label("n"))
+                .filter(SearchEvent.timestamp >= cutoff, SearchEvent.category.isnot(None))
+                .group_by(SearchEvent.category)
+                .order_by(func.count(SearchEvent.id).desc())
+                .limit(5).all()
+            )
+            top_queries = (
+                db.query(SearchEvent.clean_query, func.count(SearchEvent.id).label("n"))
+                .filter(SearchEvent.timestamp >= cutoff)
+                .group_by(SearchEvent.clean_query)
+                .order_by(func.count(SearchEvent.id).desc())
+                .limit(5).all()
+            )
+            avg_results = (
+                    db.query(func.avg(SearchEvent.result_count))
+                    .filter(SearchEvent.timestamp >= cutoff)
+                    .scalar() or 0
+            )
+            zero_result_pct = 0.0
+            if recent_searches > 0:
+                zero_results = (
+                        db.query(func.count(SearchEvent.id))
+                        .filter(
+                            SearchEvent.timestamp >= cutoff,
+                            SearchEvent.result_count == 0,
+                        )
+                        .scalar() or 0
+                )
+                zero_result_pct = round(zero_results / recent_searches * 100, 1)
+
+            return {
+                "total_users": total_users,
+                "active_users_7d": active_users,
+                "total_searches": total_searches,
+                f"searches_{days}d": recent_searches,
+                "avg_results": round(float(avg_results), 1),
+                "zero_result_pct": zero_result_pct,
+                "top_categories": [(c or "unknown", n) for c, n in top_cats],
+                "top_queries": [(q or "", n) for q, n in top_queries],
+            }
+    except Exception as e:
+        logger.error(f"[Analytics] get_stats failed: {e}")
+        return {}
 
 def save_price_snapshots(groups, scraped_at: datetime = None) -> None:
     """Persist current prices from ProductGroups into price_snapshot."""
