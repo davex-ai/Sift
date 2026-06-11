@@ -15,6 +15,7 @@ import requests as req
 from urllib.parse import quote_plus
 from typing import Optional
 
+from utils import format_ngn
 from .base import BaseScraper, Product
 from utils.currency import parse_ngn
 
@@ -162,7 +163,7 @@ class KongaScraper(BaseScraper):
             source=self.SOURCE_NAME,
             url=url,
             price_ngn=price_ngn,
-            price_raw=f"₦{price_ngn:,.2f}" if price_ngn else "",
+            price_raw=format_ngn(price_ngn) if price_ngn else "",
             currency="NGN",
             rating=rating,
             review_count=review_count,
@@ -236,7 +237,7 @@ class KongaScraper(BaseScraper):
             source=self.SOURCE_NAME,
             url=url,
             price_ngn=price_ngn,
-            price_raw=f"₦{price_ngn:,.2f}" if price_ngn else "",
+            price_raw=format_ngn(price_ngn) if price_ngn else "",
             currency="NGN",
             image_url=img or None,
             availability="in_stock",

@@ -17,10 +17,10 @@ from .temu import TemuScraper
 
 # ── Registry: name → class ─────────────────────────────────
 REGISTRY: dict[str, type[BaseScraper]] = {
-    "jumia": JumiaScraper,
+    # "jumia": JumiaScraper,
     # "jiji":  JijiScraper,
     # "konga": KongaScraper,
-    # "slot":  SlotScraper,
+    "slot":  SlotScraper,
     # "temu":  TemuScraper,
 }
 

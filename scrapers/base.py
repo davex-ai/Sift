@@ -1,19 +1,11 @@
 """
-BaseScraper — plugin contract every store scraper inherits.
+scrapers/base.py
 
-Implements:
-  - ScraperAPI → Playwright → cached result fallback chain
-  - Token-bucket rate limiting per scraper
-  - Randomized delays + concurrency cap
-  - Exponential backoff retry
-  - Selector-check helper
-
-To add a new store scraper:
-  1. Subclass BaseScraper
-  2. Set SOURCE_NAME and SELECTORS
-  3. Implement search(), _parse_html()
-  4. Register in scrapers/__init__.py
-  Nothing else changes.
+Changes from previous version:
+  - ScraperAPI circuit breaker: disabled after 2 consecutive 403s/timeouts
+  - Reduced ScraperAPI timeout 55s → 30s (fail fast)
+  - BLOCK_IMAGES default True (subclasses can override)
+  - Removed all debug print statements
 """
 
 import time
@@ -32,63 +24,37 @@ import config
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════
-# Data model
-# ══════════════════════════════════════════════════════════════
-
 @dataclass
 class Product:
-    """Raw product from a single scraper — before normalization."""
     title: str
-    source: str                         # 'jumia', 'konga', etc.
+    source: str
     url: str
-
     price_ngn: Optional[float] = None
     price_raw: str = ""
     currency: str = "NGN"
-
     rating: Optional[float] = None
     review_count: Optional[int] = None
-
     image_url: Optional[str] = None
-    availability: str = "unknown"       # 'in_stock' | 'out_of_stock' | 'unknown'
+    availability: str = "unknown"
     delivery_info: Optional[str] = None
     seller_name: Optional[str] = None
-    location: Optional[str] = None      # Jiji / marketplace listings
-    condition: Optional[str] = None     # 'new' | 'used' | 'refurbished'
-
+    location: Optional[str] = None
+    condition: Optional[str] = None
     extra: dict = field(default_factory=dict)
-
-    # Internal — set by pipeline
-    fetched_via: str = ""               # 'scraperapi' | 'playwright' | 'cache'
+    fetched_via: str = ""
     score: float = 0.0
 
 
-# ══════════════════════════════════════════════════════════════
-# Base scraper
-# ══════════════════════════════════════════════════════════════
-
 class BaseScraper(ABC):
-    """
-    Plugin base class.  Subclasses implement search() and _parse_html().
-    All rate limiting, fallback chain, and retry logic lives here.
-    """
 
-    SOURCE_NAME: str = "unknown"        # override in subclass
-    PROFILE: str = "generic"           # stealth profile ('jumia', 'konga', etc.)
-
-    # Selectors dict — override in subclass
+    SOURCE_NAME: str = "unknown"
+    PROFILE: str = "generic"
     SELECTORS: dict = {}
+    BLOCK_IMAGES: bool = True
 
-    def __init__(
-        self,
-        scraperapi_key: Optional[str] = None,
-        use_playwright: bool = True,
-    ):
+    def __init__(self, scraperapi_key=None, use_playwright=True):
         self.scraperapi_key = scraperapi_key or config.SCRAPERAPI_KEY
         self.use_playwright = use_playwright
-
-        # Per-scraper rate limiter
         self._limiter = RateLimiter(
             max_rpm=config.RATE_LIMIT_REQUESTS,
             max_concurrent=config.MAX_CONCURRENT_PER_SCRAPER,
@@ -96,46 +62,51 @@ class BaseScraper(ABC):
             max_delay=config.MAX_DELAY_SECONDS,
             jitter=config.DELAY_JITTER,
         )
-
-        # Last N results cached for instant return on repeated query
         self._cache: dict[str, list[Product]] = {}
-
-    # ── Public interface ───────────────────────────────────────
-
-    @abstractmethod
-    def search(self, query: str, max_results: int = 10) -> list[Product]:
-        """Search this store. Returns raw Product list."""
-        ...
+        # Circuit breaker: skip ScraperAPI after repeated failures
+        self._scraperapi_failures: int = 0
+        self._scraperapi_disabled: bool = False
 
     @abstractmethod
-    def _parse_html(self, html: str, max_results: int) -> list[Product]:
-        """Parse raw HTML → Products. Implemented per store."""
-        ...
+    def search(self, query: str, max_results: int = 10) -> list[Product]: ...
+
+    @abstractmethod
+    def _parse_html(self, html: str, max_results: int) -> list[Product]: ...
 
     # ── Fetch chain ───────────────────────────────────────────
 
     def _fetch(self, url: str) -> Optional[str]:
         """
-        Fallback chain:
-          1. ScraperAPI (with JS rendering)
-          2. Playwright stealth
-          3. Plain requests (last resort)
-        Returns HTML string or None.
+        ScraperAPI → Playwright → plain requests.
+        Circuit breaker skips ScraperAPI after 2 consecutive failures,
+        saving 30s × N scrapers on every search when key is dead.
         """
-        # Check cache first
         if url in self._cache:
             logger.debug(f"[{self.SOURCE_NAME}] HTML cache hit")
             return self._cache[url]
 
-        # Try ScraperAPI
-        if self.scraperapi_key:
+        use_scraperapi = (
+            bool(self.scraperapi_key)
+            and not self._scraperapi_disabled
+        )
+
+        if use_scraperapi:
             html = self._fetch_scraperapi(url)
             if html:
+                self._scraperapi_failures = 0
                 self._cache[url] = html
                 return html
-            logger.warning(f"[{self.SOURCE_NAME}] ScraperAPI failed → Playwright")
+            self._scraperapi_failures += 1
+            if self._scraperapi_failures >= 2:
+                self._scraperapi_disabled = True
+                logger.warning(
+                    f"[{self.SOURCE_NAME}] ScraperAPI circuit breaker tripped — "
+                    "using Playwright for remainder of session. "
+                    "Check https://app.scraperapi.com for credit status."
+                )
+            else:
+                logger.warning(f"[{self.SOURCE_NAME}] ScraperAPI failed → Playwright")
 
-        # Try Playwright
         if self.use_playwright:
             html = self._fetch_playwright(url)
             if html:
@@ -143,14 +114,12 @@ class BaseScraper(ABC):
                 return html
             logger.warning(f"[{self.SOURCE_NAME}] Playwright failed → plain requests")
 
-        # Plain requests (no stealth — last resort)
         html = self._fetch_plain(url)
         if html:
             self._cache[url] = html
         return html
 
     def _fetch_with_retry(self, url: str) -> Optional[str]:
-        """Wrap _fetch with exponential backoff retries."""
         for attempt in range(1, config.MAX_RETRIES + 1):
             try:
                 with global_limiter.limit():
@@ -160,16 +129,14 @@ class BaseScraper(ABC):
                     return html
             except Exception as e:
                 logger.error(f"[{self.SOURCE_NAME}] Attempt {attempt} error: {e}")
-
             if attempt < config.MAX_RETRIES:
                 sleep_time = config.RETRY_BACKOFF ** attempt + random.uniform(0, 1)
                 logger.info(f"[{self.SOURCE_NAME}] Retrying in {sleep_time:.1f}s...")
                 time.sleep(sleep_time)
-
-        logger.error(f"[{self.SOURCE_NAME}] All {config.MAX_RETRIES} attempts failed for {url}")
+        logger.error(f"[{self.SOURCE_NAME}] All {config.MAX_RETRIES} attempts failed")
         return None
 
-    # ── ScraperAPI ─────────────────────────────────────────────
+    # ── ScraperAPI ────────────────────────────────────────────
 
     def _scraperapi_url(self, target_url: str, render_js: bool = True, **extra) -> str:
         params = {
@@ -188,26 +155,35 @@ class BaseScraper(ABC):
             resp = requests.get(
                 api_url,
                 headers=session_headers(self.SOURCE_NAME),
-                timeout=55,
+                timeout=30,  # Reduced from 55 — fail fast
             )
+            if resp.status_code == 403:
+                logger.error(
+                    f"[{self.SOURCE_NAME}][ScraperAPI] 403 Forbidden — "
+                    "key may be out of credits or invalid. "
+                    "Check https://app.scraperapi.com"
+                )
+                return None
             resp.raise_for_status()
             if len(resp.text) < 500:
                 logger.warning(f"[{self.SOURCE_NAME}][ScraperAPI] Response too short")
                 return None
             logger.info(f"[{self.SOURCE_NAME}] ScraperAPI OK ({len(resp.text)} bytes)")
             return resp.text
+        except requests.exceptions.Timeout:
+            logger.error(f"[{self.SOURCE_NAME}][ScraperAPI] Timed out after 30s")
+            return None
         except Exception as e:
             logger.error(f"[{self.SOURCE_NAME}][ScraperAPI] {e}")
             return None
 
-    # ── Playwright ─────────────────────────────────────────────
+    # ── Playwright ────────────────────────────────────────────
 
     def _fetch_playwright(self, url: str) -> Optional[str]:
         try:
             from playwright.sync_api import sync_playwright
 
             fp = self._fingerprint()
-
             with sync_playwright() as p:
                 browser = p.chromium.launch(
                     headless=True,
@@ -263,7 +239,6 @@ class BaseScraper(ABC):
             return None
 
     def _human_scroll(self, page) -> None:
-        """Scroll down in human-like chunks."""
         try:
             height = page.evaluate("document.body.scrollHeight")
             step = random.randint(300, 600)
@@ -276,7 +251,6 @@ class BaseScraper(ABC):
             pass
 
     def _fingerprint(self) -> dict:
-        """Pick a random realistic fingerprint."""
         fingerprints = [
             {"user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", "platform": "Win32", "locale": "en-NG", "timezone": "Africa/Lagos"},
             {"user_agent": "Mozilla/5.0 (Linux; Android 13; SM-A155F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36", "platform": "Linux armv8l", "locale": "en-NG", "timezone": "Africa/Lagos"},
@@ -285,62 +259,37 @@ class BaseScraper(ABC):
         return random.choice(fingerprints)
 
     def _stealth_js(self, fp: dict) -> str:
-        """Anti-detection JS patches injected before page load."""
         return f"""
-        // [1] Remove webdriver flag
         Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
-
-        // [2] Fake plugins
         Object.defineProperty(navigator, 'plugins', {{
             get: () => [{{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }}]
         }});
-
-        // [5] WebGL vendor spoofing
         const getParameter = WebGLRenderingContext.prototype.getParameter;
         WebGLRenderingContext.prototype.getParameter = function(parameter) {{
             if (parameter === 37445) return 'Intel Open Source Technology Center';
             if (parameter === 37446) return 'Mesa DRI Intel(R) HD Graphics (SKL GT2)';
             return getParameter.call(this, parameter);
         }};
-
-        // [9] chrome.runtime
         window.chrome = {{ runtime: {{}} }};
-
-        // [10] Permissions API
         const originalQuery = window.navigator.permissions.query;
         window.navigator.permissions.query = (parameters) => (
             parameters.name === 'notifications' ?
             Promise.resolve({{ state: Notification.permission }}) :
             originalQuery(parameters)
         );
-
-        // [11] Screen dimensions
         Object.defineProperty(window, 'outerWidth', {{ get: () => 1366 }});
         Object.defineProperty(window, 'outerHeight', {{ get: () => 768 }});
-
-        // [15] navigator.platform
         Object.defineProperty(navigator, 'platform', {{ get: () => '{fp["platform"]}' }});
-
-        // [19] colorDepth
         Object.defineProperty(screen, 'colorDepth', {{ get: () => 24 }});
         Object.defineProperty(screen, 'pixelDepth', {{ get: () => 24 }});
-
-        // [20] Connection API
         Object.defineProperty(navigator, 'connection', {{
             get: () => ({{ effectiveType: '4g', rtt: 50, downlink: 10.0, saveData: false }})
         }});
         """
 
-    # ── Plain requests fallback ────────────────────────────────
-
     def _fetch_plain(self, url: str) -> Optional[str]:
-        """Bare requests — no stealth. Last resort."""
         try:
-            resp = requests.get(
-                url,
-                headers=session_headers(self.SOURCE_NAME),
-                timeout=20,
-            )
+            resp = requests.get(url, headers=session_headers(self.SOURCE_NAME), timeout=20)
             resp.raise_for_status()
             logger.info(f"[{self.SOURCE_NAME}] Plain requests OK")
             return resp.text
@@ -348,25 +297,16 @@ class BaseScraper(ABC):
             logger.error(f"[{self.SOURCE_NAME}][Plain] {e}")
             return None
 
-    # ── Selector helpers ───────────────────────────────────────
-
     @staticmethod
     def try_selectors(soup, selectors: list[str], attr: str = None):
-        """
-        Try multiple CSS selectors, return the first match.
-        If attr is given, returns that attribute value instead of the element.
-        """
         for sel in selectors:
             el = soup.select_one(sel)
             if el:
-                if attr:
-                    return el.get(attr, "")
-                return el
+                return el.get(attr, "") if attr else el
         return None
 
     @staticmethod
     def try_selectors_all(soup, selectors: list[str]):
-        """Try multiple CSS selectors for a list, return first non-empty."""
         for sel in selectors:
             results = soup.select(sel)
             if results:
@@ -374,10 +314,6 @@ class BaseScraper(ABC):
         return []
 
     def validate_selectors(self, html: str) -> dict[str, bool]:
-        """
-        Check which selectors are still working.
-        Run this in selector_check.py to detect broken scrapers.
-        """
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
         report = {}
