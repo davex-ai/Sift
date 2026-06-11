@@ -336,6 +336,77 @@ def get_stats(days: int = 7) -> dict:
         logger.error(f"[Analytics] get_stats failed: {e}")
         return {}
 
+
+def get_stats(days: int = 7) -> dict:
+    """
+    Return analytics summary for the /admin command.
+    Shows user counts, search volume, top categories and queries.
+    """
+    from sqlalchemy import func
+    from datetime import timedelta
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    try:
+        with session_scope() as db:
+            total_users = db.query(func.count(UserRecord.telegram_id)).scalar() or 0
+
+            active_users = (
+                    db.query(func.count(UserRecord.telegram_id))
+                    .filter(UserRecord.last_seen >= cutoff)
+                    .scalar() or 0
+            )
+            total_searches = db.query(func.count(SearchEvent.id)).scalar() or 0
+
+            recent_searches = (
+                    db.query(func.count(SearchEvent.id))
+                    .filter(SearchEvent.timestamp >= cutoff)
+                    .scalar() or 0
+            )
+            top_cats = (
+                db.query(SearchEvent.category, func.count(SearchEvent.id).label("n"))
+                .filter(SearchEvent.timestamp >= cutoff, SearchEvent.category.isnot(None))
+                .group_by(SearchEvent.category)
+                .order_by(func.count(SearchEvent.id).desc())
+                .limit(5).all()
+            )
+            top_queries = (
+                db.query(SearchEvent.clean_query, func.count(SearchEvent.id).label("n"))
+                .filter(SearchEvent.timestamp >= cutoff)
+                .group_by(SearchEvent.clean_query)
+                .order_by(func.count(SearchEvent.id).desc())
+                .limit(5).all()
+            )
+            avg_results = (
+                    db.query(func.avg(SearchEvent.result_count))
+                    .filter(SearchEvent.timestamp >= cutoff)
+                    .scalar() or 0
+            )
+            zero_result_pct = 0.0
+            if recent_searches > 0:
+                zero_results = (
+                        db.query(func.count(SearchEvent.id))
+                        .filter(
+                            SearchEvent.timestamp >= cutoff,
+                            SearchEvent.result_count == 0,
+                        )
+                        .scalar() or 0
+                )
+                zero_result_pct = round(zero_results / recent_searches * 100, 1)
+
+            return {
+                "total_users": total_users,
+                "active_users_7d": active_users,
+                "total_searches": total_searches,
+                f"searches_{days}d": recent_searches,
+                "avg_results": round(float(avg_results), 1),
+                "zero_result_pct": zero_result_pct,
+                "top_categories": [(c or "unknown", n) for c, n in top_cats],
+                "top_queries": [(q or "", n) for q, n in top_queries],
+            }
+    except Exception as e:
+        logger.error(f"[Analytics] get_stats failed: {e}")
+        return {}
+
 def save_price_snapshots(groups, scraped_at: datetime = None) -> None:
     """Persist current prices from ProductGroups into price_snapshot."""
     from normalizer.dedup import ProductGroup
