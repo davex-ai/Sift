@@ -1,15 +1,19 @@
 """
-Sift — main entry point.
+Sift — main entry point with Web Service health check emulation.
 
 Usage:
-    python main.py           # start the Telegram bot
+    python main.py           # start the Telegram bot + dummy web server
     python main.py --test    # run a single test search (no bot)
     python main.py --health  # check all scrapers
 """
 
 import sys
+import os
 import logging
 import argparse
+import asyncio
+from fastapi import FastAPI
+import uvicorn
 
 # ── Logging setup ─────────────────────────────────────────────
 logging.basicConfig(
@@ -22,8 +26,18 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("playwright").setLevel(logging.WARNING)
+logging.getLogger("uvicorn").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
+
+# ── Render Health Check Server setup ───────────────────────────
+app = FastAPI()
+
+@app.get("/")
+@app.get("/healthz")
+def health_check():
+    """Satisfies Render's HTTP health check to keep the service alive."""
+    return {"status": "healthy", "service": "Sift Bot Backend"}
 
 
 def run_test(query: str = "best blender under 50000") -> None:
@@ -39,7 +53,6 @@ def run_test(query: str = "best blender under 50000") -> None:
 
     pipeline = ShoppingPipeline()
     groups, intent = pipeline.search(query)
-
 
     if not groups:
         print("❌ No results found.")
@@ -93,6 +106,27 @@ def run_health_check() -> None:
     print(f"\n{'All scrapers OK ✅' if all_ok else 'Issues detected ⚠️'}\n")
 
 
+async def run_bot_and_server():
+    """Runs the dummy web app and the Telegram bot concurrently inside the same loop."""
+    from bot.telegram_bot import run_bot
+
+    # Get port assigned by Render, default to 8000 locally
+    port = int(os.getenv("PORT", 8000))
+    
+    # Configure uvicorn to run programmatically on the async loop
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+
+    logger.info("Starting concurrent Web Server (Health Check Wrapper) and Telegram Bot...")
+    
+    # Run the web server and the blocking telegram bot setup together
+    # wrapping run_bot in to_thread if it's completely blocking/synchronous
+    await asyncio.gather(
+        server.serve(),
+        asyncio.to_thread(run_bot)
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sift — Nigerian Price Comparison Bot")
     parser.add_argument("--test", metavar="QUERY", nargs="?",
@@ -107,10 +141,8 @@ def main():
     elif args.health:
         run_health_check()
     else:
-        # Default: start the Telegram bot
-        logger.info("Starting Sift Telegram bot...")
-        from bot.telegram_bot import run_bot
-        run_bot()
+        # Default: Run the async initialization wrapper
+        asyncio.run(run_bot_and_server())
 
 
 if __name__ == "__main__":
