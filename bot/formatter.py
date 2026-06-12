@@ -179,6 +179,7 @@ def format_help() -> str:
         "/help — This message\n"
         "/alerts — View your price alerts\n"
         "/cancel — Cancel current action\n\n"
+        "🚀 Sift was founded by [davex-ai](https://davex-ai.vercel.app)"
         "*Price Alerts:*\n"
         "After a search, tap *🔔 Set Alert* to get notified when a "
         "product drops below your target price."
