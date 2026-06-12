@@ -108,7 +108,7 @@ def run_health_check() -> None:
 
 async def run_bot_and_server():
     """Runs the web app and the Telegram bot concurrently in the same main thread loop."""
-    from bot.telegram_bot import setup_bot  # Change run_bot to a setup function
+    from bot.telegram_bot import run_bot
 
     # 1. Get port assigned by Render
     port = int(os.getenv("PORT", 8000))
@@ -118,11 +118,11 @@ async def run_bot_and_server():
     server = uvicorn.Server(config)
 
     # 3. Setup the telegram bot application
-    bot_app = setup_bot()
+    bot_app = run_bot()
 
     logger.info("Starting concurrent Web Server and Telegram Bot...")
     
-    # 4. Use python-telegram-bot's async context manager to handle polling safely
+    # 4. Use python-telegram-bot's async context manager to handle lifecycles safely
     async with bot_app:
         await bot_app.updater.start_polling(
             allowed_updates=["message", "callback_query"],
@@ -130,12 +130,22 @@ async def run_bot_and_server():
         )
         await bot_app.start()
         
-        # Run the web server; it will block here until the server stops
-        await server.serve()
+        # Start the Uvicorn server as a background task on the main loop
+        server_task = asyncio.create_task(server.serve())
         
-        # Clean shutdown after server exits
-        await bot_app.stop()
-        await bot_app.updater.stop()
+        # Keep the main loop alive while Uvicorn runs
+        try:
+            while not server.should_exit:
+                await asyncio.sleep(1)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            logger.info("Shutdown signal received...")
+        finally:
+            # Clean shutdown of both systems
+            logger.info("Stopping bot and web server...")
+            await bot_app.updater.stop()
+            await bot_app.stop()
+            server.should_exit = True
+            await server_task
 
 def main():
     parser = argparse.ArgumentParser(description="Sift — Nigerian Price Comparison Bot")

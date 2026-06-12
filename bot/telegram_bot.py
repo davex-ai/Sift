@@ -133,8 +133,11 @@ def run_bot() -> None:
     init_db()
     app = build_application()
     app.post_init = post_init
-    logger.info("[Bot] Starting polling...")
-    app.run_polling(
-        allowed_updates=["message", "callback_query"],
-        drop_pending_updates=True,
-    )
+    # logger.info("[Bot] Starting polling...")
+    # app.run_polling(
+    #     allowed_updates=["message", "callback_query"],
+    #     drop_pending_updates=True,
+    #     close_loop=False,         # <--- Add this
+    #     stop_signals=None
+    # )
+    return app
