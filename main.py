@@ -107,25 +107,35 @@ def run_health_check() -> None:
 
 
 async def run_bot_and_server():
-    """Runs the dummy web app and the Telegram bot concurrently inside the same loop."""
-    from bot.telegram_bot import run_bot
+    """Runs the web app and the Telegram bot concurrently in the same main thread loop."""
+    from bot.telegram_bot import setup_bot  # Change run_bot to a setup function
 
-    # Get port assigned by Render, default to 8000 locally
+    # 1. Get port assigned by Render
     port = int(os.getenv("PORT", 8000))
     
-    # Configure uvicorn to run programmatically on the async loop
+    # 2. Configure and build the Uvicorn server
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
 
-    logger.info("Starting concurrent Web Server (Health Check Wrapper) and Telegram Bot...")
-    
-    # Run the web server and the blocking telegram bot setup together
-    # wrapping run_bot in to_thread if it's completely blocking/synchronous
-    await asyncio.gather(
-        server.serve(),
-        asyncio.to_thread(run_bot)
-    )
+    # 3. Setup the telegram bot application
+    bot_app = setup_bot()
 
+    logger.info("Starting concurrent Web Server and Telegram Bot...")
+    
+    # 4. Use python-telegram-bot's async context manager to handle polling safely
+    async with bot_app:
+        await bot_app.updater.start_polling(
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True
+        )
+        await bot_app.start()
+        
+        # Run the web server; it will block here until the server stops
+        await server.serve()
+        
+        # Clean shutdown after server exits
+        await bot_app.stop()
+        await bot_app.updater.stop()
 
 def main():
     parser = argparse.ArgumentParser(description="Sift — Nigerian Price Comparison Bot")
