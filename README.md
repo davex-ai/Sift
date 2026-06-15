@@ -30,7 +30,7 @@
 
 <p align="center">
   
-<img width="512" height="967" width="340" alt="Sift bot in action — searching Samsung phones under ₦230,000 with AI analysis" src="https://github.com/user-attachments/assets/89e935b3-ba38-48c2-bd20-bb3da7fa24b6" />
+<img width="312" height="567" width="340" alt="Sift bot in action — searching Samsung phones under ₦230,000 with AI analysis" src="https://github.com/user-attachments/assets/89e935b3-ba38-48c2-bd20-bb3da7fa24b6" />
 
   <br/>
   <em>Sift searching for Samsung phones under ₦230,000, with AI value analysis</em>
@@ -299,6 +299,7 @@ Built with 🟢 in Nigeria — for Nigerian shoppers.
 
 Author: [Dave](https://davex-ai.vercel.app/)
 Inspiration: Was looking to build a startup, sift looked like a good idea, at first glance atleast
+[Live Link](https://t.me/siftlyai_bot)
 ---
 
 ## 🧪 Status
