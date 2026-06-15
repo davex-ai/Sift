@@ -297,9 +297,9 @@ That's it — the pipeline picks it up automatically.
 
 Built with 🟢 in Nigeria — for Nigerian shoppers.
 
-Author: [Dave](https://davex-ai.vercel.app/)
-Inspiration: Was looking to build a startup, sift looked like a good idea, at first glance atleast
-[Live Link](https://t.me/siftlyai_bot)
+- Author: [Dave](https://davex-ai.vercel.app/)
+- Inspiration: Was looking to build a startup, sift looked like a good idea, at first glance atleast
+- [Live Link](https://t.me/siftlyai_bot)
 ---
 
 ## 🧪 Status
