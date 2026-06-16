@@ -1,0 +1,37 @@
+name: Sift Keepalive Ping
+
+on:
+  schedule:
+    # Every 15 min, 09:00-12:00 UTC = 10:00 AM-1:00 PM Lagos (WAT, UTC+1)
+    - cron: "0,15,30,45 9-11 * * *"
+    - cron: "0 12 * * *"
+  workflow_dispatch: {}   # lets you trigger it manually to test
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check expiry (auto-stop after 1 month)
+        id: expiry
+        run: |
+          # Change this date to whenever you start running this workflow.
+          START_DATE="2026-06-16"
+          END_DATE=$(date -u -d "$START_DATE + 30 days" +%Y-%m-%d)
+          TODAY=$(date -u +%Y-%m-%d)
+
+          echo "Start: $START_DATE  End: $END_DATE  Today: $TODAY"
+
+          if [[ "$TODAY" > "$END_DATE" ]]; then
+            echo "expired=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "expired=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ping Render server
+        if: steps.expiry.outputs.expired == 'false'
+        run: |
+          curl -sS -o /dev/null -w "Status: %{http_code}\n" https://sift-amcs.onrender.com/healthz
+
+      - name: Skipped — keepalive window expired
+        if: steps.expiry.outputs.expired == 'true'
+        run: echo "30-day keepalive window has ended. Disable or delete this workflow."
